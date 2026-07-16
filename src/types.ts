@@ -17,6 +17,8 @@ export interface DigestIssue {
   sourceLabel: string;
   instructions?: string;
   skippedSeenCount?: number;
+  unsubscribeUrl?: string;
+  footerNote?: string;
 }
 
 export interface BuildOptions {
