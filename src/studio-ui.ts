@@ -4,6 +4,7 @@ export interface StudioPageConfig {
   defaultContentDir: string;
   signupUrl: string;
   unsubscribePlaceholder: string;
+  historyEnabled: boolean;
 }
 
 export function renderStudioPage(config: StudioPageConfig): string {
@@ -37,7 +38,11 @@ export function renderStudioPage(config: StudioPageConfig): string {
 
     <main class="grid">
       <section class="col source-col">
-        <div class="panel">
+        <button id="sourceBar" class="source-bar" type="button" hidden>
+          <span class="source-bar-main"><span class="dot"></span><span id="sourceBarLabel">Source</span></span>
+          <span class="source-bar-change">Change</span>
+        </button>
+        <div id="sourcePanel" class="panel">
           <h2>1. Source</h2>
           <div class="seg" role="tablist">
             <button id="segRss" class="seg-btn active" type="button" role="tab">RSS / Atom</button>
@@ -137,7 +142,13 @@ export function renderStudioPage(config: StudioPageConfig): string {
         <label class="field">
           <span>From <em>(a verified SMTPfast domain)</em></span>
           <input id="fromAddr" type="email" placeholder="you@yourdomain.com" value="${escapeAttr(config.defaultFrom)}" />
+          <span id="fromStatus" class="from-status" hidden></span>
         </label>
+        <div class="test-row">
+          <input id="testTo" type="email" placeholder="you@example.com" />
+          <button id="sendTestBtn" class="btn" type="button">Send test</button>
+        </div>
+        <p class="test-hint">Send one copy to yourself first to check how it looks.</p>
         <label class="field">
           <span>Recipients <em>(comma or newline separated)</em></span>
           <textarea id="recipients" rows="4" placeholder="you@example.com, teammate@example.com"></textarea>
@@ -231,6 +242,12 @@ textarea{resize:vertical}
 .seg-btn.active{background:#1a1a1c;color:var(--ink)}
 .ai-row{display:flex;align-items:center;gap:10px;margin-top:4px}
 .hint{font-size:11px;color:var(--faint)}
+.source-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;text-align:left;
+  background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;cursor:pointer;color:var(--ink);font:inherit;animation:fade-in .3s ease-out}
+.source-bar:hover{border-color:rgba(255,255,255,.2)}
+.source-bar-main{display:flex;align-items:center;gap:9px;min-width:0;font-size:13px}
+.source-bar .dot{width:8px;height:8px;border-radius:50%;background:var(--em);box-shadow:0 0 10px rgba(16,185,129,.6);flex:none}
+.source-bar-change{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
 .error{color:var(--danger);font-size:12px;margin:8px 0 0}
 .muted{color:var(--muted)} .small{font-size:12px} .count{font-family:var(--mono);font-size:11px;color:var(--muted)}
 .curate-head,.preview-head{display:flex;align-items:center;justify-content:space-between}
@@ -246,6 +263,7 @@ textarea{resize:vertical}
 .item .sum{color:var(--muted);font-size:12.5px;margin-top:4px;outline:none;border-radius:4px}
 .item [contenteditable]:focus{box-shadow:0 0 0 2px rgba(16,185,129,.4);background:#050506}
 .item .meta{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-top:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.badge{display:inline-block;font-family:var(--mono);font-size:9.5px;text-transform:uppercase;letter-spacing:.08em;padding:2px 6px;border-radius:5px;margin-left:8px;vertical-align:1px;border:1px solid rgba(245,158,11,.4);color:#fbbf24;background:rgba(245,158,11,.08)}
 .item .moves{display:flex;flex-direction:column;gap:4px}
 .move{border:1px solid var(--line);background:#141415;color:var(--muted);border-radius:6px;width:24px;height:22px;cursor:pointer;font-size:11px;line-height:1;padding:0}
 .move:hover{color:var(--ink)}
@@ -262,6 +280,12 @@ iframe{width:100%;height:100%;border:0;display:block;background:#e9edf2}
 .icon-btn{border:0;background:transparent;color:var(--muted);font-size:24px;cursor:pointer;line-height:1}
 .check{display:flex;gap:8px;align-items:center;margin:4px 0 12px;color:var(--muted);font-size:12.5px}
 .check input{width:auto;accent-color:var(--em)}
+.from-status{display:block;margin-top:6px;font-family:var(--mono);font-size:11px}
+.from-status.ok{color:var(--ok)} .from-status.warn{color:#fbbf24} .from-status.checking{color:var(--muted)}
+.test-row{display:flex;gap:8px;margin:0 0 4px}
+.test-row input{flex:1}
+.test-row .btn{flex:none;white-space:nowrap}
+.test-hint{margin:0 0 14px;font-size:11px;color:var(--faint)}
 .unsub-note{font-size:12px;color:var(--muted);background:#0a0a0b;border:1px solid var(--line);border-radius:10px;padding:10px 12px;margin:0 0 14px}
 .unsub-note code{color:var(--em2);font-size:11.5px}
 .send-result{margin-top:14px;font-size:13px;border-radius:10px;padding:12px;border:1px solid var(--line)}
@@ -315,10 +339,11 @@ async function load(){
     const data = await res.json();
     if(!res.ok){ throw new Error(data.error||"Load failed"); }
     state.sourceLabel = data.sourceLabel || "Digest";
-    state.items = (data.items||[]).map((it)=>({ ...it, included:true, _id:++uid }));
-    if(!$("subject").value){ $("subject").value = defaultSubject(); }
-    renderItems(); schedulePreview(); enableSend();
-    setStatus(state.items.length + " items loaded", "ok");
+    state.items = (data.items||[]).map((it)=>({ ...it, included: !it.seen, _id:++uid }));
+    autoDraft();
+    renderItems(); schedulePreview(); enableSend(); collapseSource();
+    const seenCount = state.items.filter((i)=>i.seen).length;
+    setStatus(state.items.length + " loaded" + (seenCount ? " · " + seenCount + " already sent" : ""), "ok");
   }catch(e){ err.textContent = e.message; err.hidden = false; setStatus("Load failed","err"); }
   finally{ btn.disabled = false; btn.textContent = "Load items"; }
 }
@@ -326,6 +351,26 @@ function defaultSubject(){
   const d = new Date();
   return state.sourceLabel + " digest: " + d.toLocaleDateString("en",{month:"short",day:"numeric"});
 }
+// Land the user on a finished draft instead of blank fields.
+function autoDraft(){
+  const inc = includedItems();
+  if(!$("subject").value.trim()){ $("subject").value = defaultSubject(); }
+  if(!$("preheader").value.trim()){
+    const first = inc[0] && inc[0].title;
+    const more = inc.length - 1;
+    $("preheader").value = first
+      ? (more > 0 ? first + " and " + more + " more update" + (more===1?"":"s") : first)
+      : "Latest updates.";
+  }
+  if(!$("intro").value.trim()){ $("intro").value = "The latest from " + state.sourceLabel + "."; }
+}
+// ---- collapsible source ----
+function collapseSource(){
+  $("sourcePanel").hidden = true;
+  $("sourceBar").hidden = false;
+  $("sourceBarLabel").textContent = state.sourceLabel + " · " + state.items.length + " items";
+}
+$("sourceBar").onclick = ()=>{ $("sourceBar").hidden = true; $("sourcePanel").hidden = false; };
 
 // ---- item list ----
 function includedItems(){ return state.items.filter((i)=>i.included); }
@@ -351,6 +396,7 @@ function itemCard(item, index){
       + '<input class="chk" type="checkbox" ' + (item.included?"checked":"") + ' title="Include in digest">'
     + '</div>'
     + '<div class="body">'
+      + (item.seen ? '<span class="badge" title="This item was sent in a previous digest">already sent</span>' : '')
       + '<div class="ttl" contenteditable="true" spellcheck="false"></div>'
       + '<div class="sum" contenteditable="true" spellcheck="false" data-empty="Add a summary…"></div>'
       + (meta ? '<div class="meta">'+escapeHtml(meta)+'</div>' : '')
@@ -453,25 +499,57 @@ $("closeSend").onclick = ()=>{ $("sendOverlay").hidden=true; };
 $("sendOverlay").addEventListener("click",(e)=>{ if(e.target===$("sendOverlay")) $("sendOverlay").hidden=true; });
 const savedKey = localStorage.getItem("feedletter.apiKey");
 if(savedKey){ $("apiKey").value = savedKey; $("rememberKey").checked = true; }
-$("sendBtn").onclick = send;
-async function send(){
+
+// ---- verify the From domain against the account ----
+let verifyTimer = null;
+function scheduleVerify(){ clearTimeout(verifyTimer); verifyTimer = setTimeout(verifyFrom, 550); }
+$("apiKey").addEventListener("input", scheduleVerify);
+$("fromAddr").addEventListener("input", scheduleVerify);
+if($("apiKey").value && $("fromAddr").value) scheduleVerify();
+async function verifyFrom(){
+  const key = $("apiKey").value.trim(), from = $("fromAddr").value.trim();
+  const el = $("fromStatus");
+  if(!key || from.indexOf("@") < 1){ el.hidden = true; return; }
+  el.hidden = false; el.className = "from-status checking"; el.textContent = "Checking domain…";
+  try{
+    const res = await fetch("/api/verify-domain",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({apiKey:key,from})});
+    const d = await res.json();
+    if(!res.ok) throw new Error(d.error||"check failed");
+    if(d.verified){ el.className = "from-status ok"; el.textContent = "✓ Domain verified for sending"; }
+    else if(d.found){ el.className = "from-status warn"; el.textContent = "Domain is on your account but not verified yet"; }
+    else { el.className = "from-status warn"; el.innerHTML = 'Not a sending domain on this account. <a href="'+cfg.signupUrl+'" target="_blank" rel="noopener">Add it</a>'; }
+  }catch(e){ el.hidden = true; }
+}
+
+// ---- send (digest to the list, or a test to yourself) ----
+$("sendBtn").onclick = ()=> doSend(false);
+$("sendTestBtn").onclick = ()=> doSend(true);
+async function doSend(isTest){
   const out = $("sendResult"); out.hidden=false; out.className="send-result";
-  const btn=$("sendBtn"); btn.disabled=true; const label=btn.textContent; btn.innerHTML='<span class="spin"></span> Sending…';
+  const btn = isTest ? $("sendTestBtn") : $("sendBtn");
+  btn.disabled=true; const label=btn.textContent; btn.innerHTML='<span class="spin"></span> Sending…';
   try{
     await refreshPreview();
     if($("rememberKey").checked){ localStorage.setItem("feedletter.apiKey",$("apiKey").value); } else { localStorage.removeItem("feedletter.apiKey"); }
-    const body = { apiKey:$("apiKey").value, from:$("fromAddr").value, subject:$("subject").value, recipients:$("recipients").value, html:state.lastHtml, text:state.lastText };
+    const recipients = isTest ? $("testTo").value : $("recipients").value;
+    const body = {
+      apiKey:$("apiKey").value, from:$("fromAddr").value, subject:$("subject").value,
+      recipients, html:state.lastHtml, text:state.lastText, test:isTest, sourceLabel:state.sourceLabel,
+      items: includedItems().map((i)=>({ title:i.title, url:i.url, summary:i.summary, date:i.date, author:i.author, source:i.source })),
+    };
     const res = await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"Send failed");
     const failed = (data.results||[]).filter((r)=>!r.ok);
     out.classList.add(data.failed? "err":"ok");
-    out.innerHTML = "<strong>Sent "+data.sent+", failed "+data.failed+".</strong>"
+    out.innerHTML = "<strong>"+(isTest?"Test sent":"Sent")+" to "+data.sent+", failed "+data.failed+".</strong>"
       + (failed.length? "<ul>"+failed.map((r)=>"<li>"+escapeHtml(r.recipient)+": "+escapeHtml(r.error||"")+"</li>").join("")+"</ul>" : "");
-    setStatus(data.failed? "Sent with "+data.failed+" errors":"Sent "+data.sent, data.failed?"err":"ok");
+    setStatus(data.failed? "Sent with "+data.failed+" errors" : (isTest?"Test sent":"Sent "+data.sent), data.failed?"err":"ok");
+    if(!isTest && !data.failed) markSent();
   }catch(e){ out.classList.add("err"); out.textContent=e.message; setStatus(e.message,"err"); }
   finally{ btn.disabled=false; btn.textContent=label; }
 }
+function markSent(){ includedItems().forEach((i)=> i.seen = true); renderItems(); }
 
 function escapeHtml(v){ return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 setTab("email");
