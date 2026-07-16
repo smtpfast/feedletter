@@ -50,6 +50,23 @@ export function sortByDateDesc<T extends { date?: string }>(items: T[]): T[] {
   });
 }
 
+export async function mapWithConcurrency<T, R>(
+  items: T[],
+  limit: number,
+  mapper: (item: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(Math.max(limit, 1), items.length) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await mapper(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function writeOutputFile(outDir: string, fileName: string, content: string) {
   await mkdir(outDir, { recursive: true });
   await writeFile(path.join(outDir, fileName), content, "utf8");
