@@ -101,3 +101,46 @@ export function parseRecipients(raw: string): string[] {
     .map((value) => value.trim())
     .filter(Boolean);
 }
+
+interface SmtpfastDomain {
+  domain: string;
+  status: string;
+}
+
+export interface DomainCheck {
+  found: boolean;
+  verified: boolean;
+  status?: string;
+}
+
+/**
+ * Check whether the domain of a From address is a verified SMTPfast sending
+ * domain. Returns found=false when it is not registered on the account.
+ */
+export async function verifyFromDomain(config: SmtpfastConfig, from: string): Promise<DomainCheck> {
+  const at = from.lastIndexOf("@");
+  const host = (at >= 0 ? from.slice(at + 1) : from).trim().toLowerCase();
+  if (!host) return { found: false, verified: false };
+
+  const base = (config.baseUrl ?? SMTPFAST_DEFAULT_BASE_URL).replace(/\/$/, "");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), SEND_TIMEOUT_MS);
+  try {
+    const res = await fetch(`${base}/v1/domains`, {
+      headers: { authorization: `Bearer ${config.apiKey}` },
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      const body = await res.text();
+      throw new Error(`${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ""}`);
+    }
+    const domains = (await res.json()) as SmtpfastDomain[];
+    const match = Array.isArray(domains)
+      ? domains.find((d) => typeof d.domain === "string" && d.domain.toLowerCase() === host)
+      : undefined;
+    if (!match) return { found: false, verified: false };
+    return { found: true, verified: match.status === "verified", status: match.status };
+  } finally {
+    clearTimeout(timer);
+  }
+}
