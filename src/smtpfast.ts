@@ -118,8 +118,10 @@ export interface DomainCheck {
  * domain. Returns found=false when it is not registered on the account.
  */
 export async function verifyFromDomain(config: SmtpfastConfig, from: string): Promise<DomainCheck> {
-  const at = from.lastIndexOf("@");
-  const host = (at >= 0 ? from.slice(at + 1) : from).trim().toLowerCase();
+  const angle = from.match(/<([^>]+)>/);
+  const address = (angle ? angle[1] : from).trim();
+  const at = address.lastIndexOf("@");
+  const host = (at >= 0 ? address.slice(at + 1) : address).trim().toLowerCase();
   if (!host) return { found: false, verified: false };
 
   const base = (config.baseUrl ?? SMTPFAST_DEFAULT_BASE_URL).replace(/\/$/, "");

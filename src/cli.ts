@@ -8,9 +8,16 @@ import { HistoryStore, itemHistoryKey } from "./history.js";
 import { startPreviewServer } from "./preview.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
+import {
+  parseRecipients,
+  sendDigest,
+  SMTPFAST_DEFAULT_BASE_URL,
+  UNSUBSCRIBE_PLACEHOLDER,
+} from "./smtpfast.js";
 import { startStudioServer } from "./studio.js";
 import { requireOneSource, writeOutputFile } from "./utils.js";
 import { enrichIssueWithCommand } from "./writer.js";
+import type { DigestIssue } from "./types.js";
 
 const program = new Command();
 
@@ -187,6 +194,76 @@ program
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
+    }
+  });
+
+program
+  .command("send")
+  .description("Send a built issue with SMTPfast. Reads issue.json from a build output directory.")
+  .requiredOption("--from <email>", 'Verified sender, e.g. "Weekly <news@yourdomain.com>"')
+  .option("--dir <dir>", "Build output directory containing issue.json", "dist/feedletter")
+  .option("--to <list>", "Recipients, comma/space/newline separated")
+  .option("--to-file <path>", "File with one recipient per line (# comments allowed)")
+  .option("--footer <text>", "Footer note shown above the unsubscribe link")
+  .option("--api-key <key>", "SMTPfast API key (defaults to SMTPFAST_API_KEY)")
+  .option("--api-url <url>", "SMTPfast API base URL", process.env.SMTPFAST_API_URL ?? SMTPFAST_DEFAULT_BASE_URL)
+  .option("--test", "Send only to the first recipient and skip history")
+  .option("--history-db <path>", "SQLite file used to record sent items", ".feedletter/feedletter.sqlite")
+  .option("--no-history", "Do not record sent items")
+  .action(async (options) => {
+    let history: HistoryStore | undefined;
+    try {
+      const apiKey = options.apiKey ?? process.env.SMTPFAST_API_KEY;
+      if (!apiKey) throw new Error("Provide --api-key or set SMTPFAST_API_KEY.");
+
+      const rawIssue = await readFile(path.join(path.resolve(options.dir), "issue.json"), "utf8");
+      const issue = JSON.parse(rawIssue) as DigestIssue;
+
+      let recipients: string[] = [];
+      if (options.toFile) {
+        const fileText = await readFile(path.resolve(options.toFile), "utf8");
+        recipients = parseRecipients(
+          fileText
+            .split(/\r?\n/)
+            .filter((line) => !line.trim().startsWith("#"))
+            .join("\n"),
+        );
+      }
+      if (options.to) recipients = recipients.concat(parseRecipients(options.to));
+      if (recipients.length === 0) throw new Error("Provide --to or --to-file with at least one recipient.");
+      if (options.test) recipients = recipients.slice(0, 1);
+
+      // Re-render with the unsubscribe placeholder so every recipient gets a
+      // working one-click unsubscribe (SMTPfast substitutes it per recipient).
+      const sendable: DigestIssue = {
+        ...issue,
+        unsubscribeUrl: UNSUBSCRIBE_PLACEHOLDER,
+        footerNote: options.footer ?? issue.footerNote,
+      };
+      const html = renderHtml(sendable);
+      const text = renderText(sendable);
+
+      const results = await sendDigest(
+        { apiKey, baseUrl: options.apiUrl },
+        { from: options.from, subject: issue.title, html, text },
+        recipients,
+      );
+      const sent = results.filter((r) => r.ok).length;
+      const failures = results.filter((r) => !r.ok);
+
+      if (!options.test && sent > 0 && options.history) {
+        history = await HistoryStore.open(path.resolve(options.historyDb));
+        await history.recordIssue(issue);
+      }
+
+      console.log(`${options.test ? "Test sent" : "Sent"} to ${sent}, failed ${failures.length}.`);
+      for (const failure of failures) console.error(`  ${failure.recipient}: ${failure.error}`);
+      if (failures.length > 0) process.exitCode = 1;
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    } finally {
+      history?.close();
     }
   });
 

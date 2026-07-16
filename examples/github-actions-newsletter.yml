@@ -1,0 +1,68 @@
+# Copy this into .github/workflows/newsletter.yml in your own repo to send a
+# recurring newsletter with Feedletter and SMTPfast, no server required.
+#
+# Setup:
+#   1. Add a repository secret SMTPFAST_API_KEY (SMTPfast dashboard -> API keys).
+#   2. Put your recipients in recipients.txt (one email per line, # for comments).
+#   3. Point the build step at your feed or content directory.
+#   4. The job commits .feedletter/feedletter.sqlite back so the same post is
+#      never sent twice across runs.
+
+name: Newsletter
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # every Monday at 09:00 UTC
+  workflow_dispatch: {} # allow manual runs from the Actions tab
+
+permissions:
+  contents: write # needed to commit the send history back
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      # Build the issue from a feed (or swap --rss for --content ./content).
+      - name: Build the issue
+        run: |
+          npx feedletter@latest build \
+            --rss https://your-blog.example.com/rss.xml \
+            --title "This week from the blog" \
+            --limit 6 \
+            --out dist/newsletter
+
+      # Nothing new since last run -> issue.json will be absent, so skip sending.
+      - name: Check for a new issue
+        id: issue
+        run: |
+          if [ -f dist/newsletter/issue.json ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "No new items this week, nothing to send."
+          fi
+
+      - name: Send with SMTPfast
+        if: steps.issue.outputs.ready == 'true'
+        env:
+          SMTPFAST_API_KEY: ${{ secrets.SMTPFAST_API_KEY }}
+        run: |
+          npx feedletter@latest send \
+            --dir dist/newsletter \
+            --from "Weekly <news@yourdomain.com>" \
+            --to-file recipients.txt
+
+      - name: Save send history
+        if: steps.issue.outputs.ready == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f .feedletter/feedletter.sqlite
+          git commit -m "Record newsletter send" || echo "nothing to commit"
+          git push
