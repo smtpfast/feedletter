@@ -1,0 +1,49 @@
+{
+  "name": "feedletter",
+  "version": "0.1.0",
+  "description": "Generate clean email digests from RSS feeds or local Markdown content.",
+  "type": "module",
+  "bin": {
+    "feedletter": "./dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx src/cli.ts",
+    "preview": "tsx src/cli.ts preview",
+    "test": "vitest run",
+    "check": "tsc --noEmit"
+  },
+  "keywords": [
+    "newsletter",
+    "email",
+    "rss",
+    "markdown",
+    "digest",
+    "template"
+  ],
+  "author": "Feedletter contributors",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@types/sql.js": "^1.4.11",
+    "commander": "^12.1.0",
+    "fast-glob": "^3.3.2",
+    "fast-xml-parser": "^4.5.0",
+    "gray-matter": "^4.0.3",
+    "sql.js": "^1.14.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.11",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.3",
+    "vitest": "^2.0.4"
+  }
+}
