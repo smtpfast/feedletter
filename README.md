@@ -3,9 +3,14 @@
 Generate clean email digests from RSS feeds or local Markdown content.
 
 Feedletter is a small open source CLI for teams that publish content and want a
-fast path from "new posts exist" to "ready-to-send email template." It can read
-an RSS/Atom feed or a local Markdown/MDX directory, select recent items, and
-write email-safe HTML, plain text, and structured JSON.
+fast path from "new posts exist" to "sent newsletter." It can read an RSS/Atom
+feed or a local Markdown/MDX directory, select recent items, and write
+email-safe HTML, plain text, and structured JSON.
+
+The `feedletter studio` command opens a local browser tool where you pick which
+items to include, reorder and edit them, tweak the subject and intro, watch a
+live preview, and send the result with [SMTPfast](https://smtpfa.st). No hosting,
+no account required to build; you only need an SMTPfast key when you want to send.
 
 Optional AI enrichment can improve the subject, preheader, and intro using any
 OpenAI-compatible chat completions API. You can also plug in a local/editor
@@ -13,9 +18,10 @@ agent command such as Claude Code, Codex, or your own script.
 
 ## Features
 
+- browser studio: click-ops curation, inline editing, live preview, one-click send
 - RSS/Atom and Markdown/MDX ingestion
 - polished email-safe HTML and plain-text output
-- local preview UI for reviewing the rendered email
+- per-recipient unsubscribe links via SMTPfast (`{{unsubscribe_url}}`)
 - SQLite history tracking so the same post is not included twice
 - custom editorial instructions from a Markdown file
 - OpenAI-compatible enrichment
@@ -64,6 +70,40 @@ feedletter preview --dir dist/feedletter --port 4173
 ```
 
 Then open `http://127.0.0.1:4173`.
+
+## Studio
+
+The studio is the fastest way to go from a feed to a sent issue. Start it and
+open the printed URL:
+
+```bash
+feedletter studio
+# or preload a source: feedletter studio --content ./content/blog --base-url https://example.com
+```
+
+In the studio you can:
+
+- load items from an RSS/Atom feed or a Markdown directory
+- include or drop each item, reorder by drag or arrows, and edit titles and
+  summaries inline
+- edit the subject, preheader, intro, and an optional footer note
+- polish the copy with **Improve with AI** (uses your own key, server-side)
+- watch a live email and plain-text preview as you go
+- send with **SMTPfast**: paste an API key and a verified sender, add
+  recipients, and Feedletter sends one message per recipient so nobody sees the
+  list, each with its own unsubscribe link
+
+You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
+or `?dir=./content/blog&base=https://example.com`.
+
+### Sending with SMTPfast
+
+Sending is powered by [SMTPfast](https://smtpfa.st). It handles verified sending
+domains, per-recipient unsubscribe, and deliverability, which is the part
+Feedletter deliberately does not try to reinvent. Create a free account and an
+API key in the dashboard, verify a sending domain, and paste the key into the
+studio's send panel. For large audiences, use SMTPfast broadcasts and contacts
+instead of a one-off recipient list.
 
 ## History Tracking
 
