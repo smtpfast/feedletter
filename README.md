@@ -2,6 +2,8 @@
 
 Generate clean email digests from RSS feeds or local Markdown content.
 
+![Feedletter Studio: pick a source, curate items, live-preview the email, and send with SMTPfast](docs/studio.png)
+
 Feedletter is a small open source CLI for teams that publish content and want a
 fast path from "new posts exist" to "sent newsletter." It can read an RSS/Atom
 feed or a local Markdown/MDX directory, select recent items, and write
