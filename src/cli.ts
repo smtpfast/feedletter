@@ -8,6 +8,7 @@ import { HistoryStore, itemHistoryKey } from "./history.js";
 import { startPreviewServer } from "./preview.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
+import { startStudioServer } from "./studio.js";
 import { requireOneSource, writeOutputFile } from "./utils.js";
 import { enrichIssueWithCommand } from "./writer.js";
 
@@ -145,6 +146,32 @@ program
         port,
       });
       console.log(`Feedletter preview running at http://${options.host}:${port}`);
+    } catch (error) {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exitCode = 1;
+    }
+  });
+
+program
+  .command("studio")
+  .description("Open the browser studio to curate items, edit copy, preview, and send with SMTPfast.")
+  .option("--host <host>", "Host to bind", "127.0.0.1")
+  .option("--port <number>", "Port to bind", "4180")
+  .option("--content <dir>", "Default local Markdown/MDX content directory")
+  .option("--base-url <url>", "Default base URL for relative Markdown slugs")
+  .option("--from <email>", "Default sender address for the send panel")
+  .action(async (options) => {
+    try {
+      const port = Number.parseInt(options.port, 10);
+      if (!Number.isFinite(port) || port < 1) throw new Error("--port must be a positive number.");
+      await startStudioServer({
+        host: options.host,
+        port,
+        contentDir: options.content,
+        baseUrl: options.baseUrl,
+        defaultFrom: options.from,
+      });
+      console.log(`Feedletter Studio running at http://${options.host}:${port}`);
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
