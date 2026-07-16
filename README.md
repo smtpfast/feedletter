@@ -84,14 +84,19 @@ feedletter studio
 In the studio you can:
 
 - load items from an RSS/Atom feed or a Markdown directory
+- start from a filled-in draft: the subject, preheader, and intro are written
+  for you the moment items load
 - include or drop each item, reorder by drag or arrows, and edit titles and
   summaries inline
+- see an **already sent** badge on items from a previous issue, so you never
+  send the same post twice (tracked in the same SQLite history as `build`)
 - edit the subject, preheader, intro, and an optional footer note
 - polish the copy with **Improve with AI** (uses your own key, server-side)
 - watch a live email and plain-text preview as you go
-- send with **SMTPfast**: paste an API key and a verified sender, add
-  recipients, and Feedletter sends one message per recipient so nobody sees the
-  list, each with its own unsubscribe link
+- send with **SMTPfast**: paste an API key and a verified sender, and Feedletter
+  checks the sender domain is verified, lets you send a test to yourself first,
+  then sends one message per recipient so nobody sees the list, each with its
+  own unsubscribe link
 
 You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
 or `?dir=./content/blog&base=https://example.com`.
