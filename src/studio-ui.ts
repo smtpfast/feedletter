@@ -94,6 +94,11 @@ export function renderStudioPage(config: StudioPageConfig): string {
             <button id="improveBtn" class="btn ghost" type="button" ${config.writerLabel ? "" : "disabled"}>✨ Improve with ${escapeHtml(config.writerLabel ?? "AI")}</button>
             ${config.writerLabel ? "" : '<span class="hint">Set OPENAI_API_KEY + AI_MODEL, or pass --agent-command</span>'}
           </div>
+          <div class="draft-row">
+            <button id="exportBtn" class="btn tiny" type="button">↓ Save draft</button>
+            <label class="btn tiny" for="importInput">↑ Open draft</label>
+            <input id="importInput" type="file" accept="application/json,.json" hidden />
+          </div>
         </div>
       </section>
 
@@ -140,7 +145,11 @@ export function renderStudioPage(config: StudioPageConfig): string {
           <input id="apiKey" type="password" placeholder="sf_..." autocomplete="off" />
         </label>
         <label class="field">
-          <span>From <em>(a verified SMTPfast domain)</em></span>
+          <span>From name <em>(optional, shown as the sender)</em></span>
+          <input id="fromName" type="text" placeholder="The Weekly" />
+        </label>
+        <label class="field">
+          <span>From address <em>(a verified SMTPfast domain)</em></span>
           <input id="fromAddr" type="email" placeholder="you@yourdomain.com" value="${escapeAttr(config.defaultFrom)}" />
           <span id="fromStatus" class="from-status" hidden></span>
         </label>
@@ -157,9 +166,13 @@ export function renderStudioPage(config: StudioPageConfig): string {
           <input id="rememberKey" type="checkbox" />
           <span>Remember the API key in this browser</span>
         </label>
-        <div class="unsub-note">Each recipient gets their own unsubscribe link via <code>${escapeHtml(config.unsubscribePlaceholder)}</code>. Sending goes one message per recipient, so nobody sees the list. For large audiences, use SMTPfast broadcasts.</div>
+        <div class="unsub-note">Each recipient gets their own unsubscribe link via <code>${escapeHtml(config.unsubscribePlaceholder)}</code>. Sending goes one message per recipient, so nobody sees the list.</div>
         <button id="sendBtn" class="btn primary block" type="button">Send digest</button>
         <div id="sendResult" class="send-result" hidden></div>
+        <div class="broadcast-note">
+          <strong>Sending to a big list?</strong> Feedletter sends one at a time, which is fine up to ~50. For larger audiences, paste this into a <a href="${config.signupUrl}/dashboard" target="_blank" rel="noopener">SMTPfast broadcast</a> and send to your contacts with analytics.
+          <button id="copyHtmlBtn" class="btn tiny" type="button">Copy email HTML</button>
+        </div>
       </div>
     </div>
 
@@ -242,6 +255,12 @@ textarea{resize:vertical}
 .seg-btn.active{background:#1a1a1c;color:var(--ink)}
 .ai-row{display:flex;align-items:center;gap:10px;margin-top:4px}
 .hint{font-size:11px;color:var(--faint)}
+.btn.tiny{padding:6px 10px;font-size:12px;font-weight:600;border-radius:8px}
+.draft-row{display:flex;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+.draft-row label.btn{display:inline-flex;align-items:center;cursor:pointer}
+.broadcast-note{margin-top:16px;padding:12px;border:1px dashed var(--line);border-radius:10px;font-size:12px;color:var(--muted);line-height:1.55}
+.broadcast-note strong{color:var(--ink)}
+.broadcast-note .btn{margin-top:10px}
 .source-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;text-align:left;
   background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;cursor:pointer;color:var(--ink);font:inherit;animation:fade-in .3s ease-out}
 .source-bar:hover{border-color:rgba(255,255,255,.2)}
@@ -435,6 +454,7 @@ function wireDrag(el){
 ["subject","preheader","intro","footerNote"].forEach((id)=> $(id).addEventListener("input", schedulePreview));
 
 // ---- preview ----
+function itemPayload(i){ return { title:i.title, url:i.url, summary:i.summary, date:i.date, author:i.author, source:i.source, image:i.image }; }
 function draft(){
   return {
     title: $("subject").value || "Latest updates",
@@ -443,7 +463,7 @@ function draft(){
     footerNote: $("footerNote").value,
     sourceLabel: state.sourceLabel,
     includeUnsubscribe: true,
-    items: includedItems().map((i)=>({ title:i.title, url:i.url, summary:i.summary, date:i.date, author:i.author, source:i.source })),
+    items: includedItems().map(itemPayload),
   };
 }
 function schedulePreview(){ clearTimeout(previewTimer); previewTimer = setTimeout(refreshPreview, 320); }
@@ -532,10 +552,13 @@ async function doSend(isTest){
     await refreshPreview();
     if($("rememberKey").checked){ localStorage.setItem("feedletter.apiKey",$("apiKey").value); } else { localStorage.removeItem("feedletter.apiKey"); }
     const recipients = isTest ? $("testTo").value : $("recipients").value;
+    const name = $("fromName").value.trim();
+    const addr = $("fromAddr").value.trim();
+    const from = name && addr ? name + " <" + addr + ">" : addr;
     const body = {
-      apiKey:$("apiKey").value, from:$("fromAddr").value, subject:$("subject").value,
+      apiKey:$("apiKey").value, from, subject:$("subject").value,
       recipients, html:state.lastHtml, text:state.lastText, test:isTest, sourceLabel:state.sourceLabel,
-      items: includedItems().map((i)=>({ title:i.title, url:i.url, summary:i.summary, date:i.date, author:i.author, source:i.source })),
+      items: includedItems().map(itemPayload),
     };
     const res = await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     const data = await res.json();
@@ -550,6 +573,49 @@ async function doSend(isTest){
   finally{ btn.disabled=false; btn.textContent=label; }
 }
 function markSent(){ includedItems().forEach((i)=> i.seen = true); renderItems(); }
+
+// ---- copy HTML for a SMTPfast broadcast ----
+$("copyHtmlBtn").onclick = async ()=>{
+  await refreshPreview();
+  try{
+    await navigator.clipboard.writeText(state.lastHtml || "");
+    const b = $("copyHtmlBtn"); b.textContent = "Copied ✓";
+    setTimeout(()=>{ b.textContent = "Copy email HTML"; }, 1500);
+    setStatus("Email HTML copied","ok");
+  }catch(e){ setStatus("Copy failed, open the Email preview and copy from there","err"); }
+};
+
+// ---- save / open a draft ----
+$("exportBtn").onclick = ()=>{
+  const data = {
+    version:1, sourceLabel:state.sourceLabel,
+    subject:$("subject").value, preheader:$("preheader").value, intro:$("intro").value, footerNote:$("footerNote").value,
+    fromName:$("fromName").value,
+    items: state.items.map((i)=>({ ...itemPayload(i), included:i.included, seen:i.seen })),
+  };
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([JSON.stringify(data,null,2)], {type:"application/json"}));
+  a.download = (state.sourceLabel||"feedletter").replace(/[^a-z0-9]+/gi,"-").toLowerCase() + "-draft.json";
+  a.click(); URL.revokeObjectURL(a.href);
+  setStatus("Draft saved","ok");
+};
+$("importInput").onchange = (e)=>{
+  const file = e.target.files && e.target.files[0]; if(!file) return;
+  const reader = new FileReader();
+  reader.onload = ()=>{
+    try{
+      const d = JSON.parse(String(reader.result));
+      state.sourceLabel = d.sourceLabel || state.sourceLabel;
+      state.items = (d.items||[]).map((it)=>({ ...it, _id:++uid, included: it.included!==false }));
+      $("subject").value = d.subject||""; $("preheader").value = d.preheader||"";
+      $("intro").value = d.intro||""; $("footerNote").value = d.footerNote||"";
+      if(d.fromName!==undefined) $("fromName").value = d.fromName||"";
+      renderItems(); schedulePreview(); enableSend(); collapseSource();
+      setStatus("Draft loaded","ok");
+    }catch(err){ setStatus("Could not read that draft file","err"); }
+  };
+  reader.readAsText(file); e.target.value = "";
+};
 
 function escapeHtml(v){ return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 setTab("email");

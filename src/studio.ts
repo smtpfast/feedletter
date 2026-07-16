@@ -79,6 +79,7 @@ function normalizeItems(value: unknown): SourceItem[] {
       date: typeof input.date === "string" ? input.date : undefined,
       author: typeof input.author === "string" ? input.author : undefined,
       source: typeof input.source === "string" ? input.source : undefined,
+      image: typeof input.image === "string" ? input.image : undefined,
     } satisfies SourceItem;
   });
 }
