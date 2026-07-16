@@ -97,15 +97,40 @@ In the studio you can:
   external writer like `claude -p` or `codex` when you start studio with
   `--agent-command`, so you can skip the API entirely)
 - watch a live email and plain-text preview as you go
+- set a **From name** and pull each post's **cover image** into the email
+- **save a draft** to JSON and open it later to pick up where you left off
 - send with **SMTPfast**: paste an API key and a verified sender, and Feedletter
   checks the sender domain is verified, lets you send a test to yourself first,
   then sends one message per recipient so nobody sees the list, each with its
   own unsubscribe link
+- for a large audience, hand the email off to a **SMTPfast broadcast** with one
+  click instead of sending one at a time
 
 You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
 or `?dir=./content/blog&base=https://example.com`.
 
-### Sending with SMTPfast
+## Automation
+
+For a hands-off recurring newsletter, build and send from the command line, no
+browser required. The `send` command reads a build output directory and sends
+the issue with SMTPfast, re-rendering it with a per-recipient unsubscribe link:
+
+```bash
+feedletter build --rss https://your-blog.example.com/rss.xml --limit 6 --out dist/newsletter
+
+SMTPFAST_API_KEY=sf_... feedletter send \
+  --dir dist/newsletter \
+  --from "Weekly <news@yourdomain.com>" \
+  --to-file recipients.txt
+```
+
+Add `--test` to send only to the first recipient. Pair the two commands with a
+scheduled GitHub Action to send every week automatically. A ready-to-copy
+workflow is in [`examples/github-actions-newsletter.yml`](examples/github-actions-newsletter.yml):
+it builds on a cron schedule, sends with SMTPfast, and commits the history file
+back so the same post is never sent twice.
+
+## Sending with SMTPfast
 
 Sending is powered by [SMTPfast](https://smtpfa.st). It handles verified sending
 domains, per-recipient unsubscribe, and deliverability, which is the part
