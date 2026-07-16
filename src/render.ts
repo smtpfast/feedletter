@@ -50,7 +50,7 @@ function renderItem(item: SourceItem) {
               ${summary ? `<p style="margin:0 0 16px;font-size:15px;line-height:24px;color:#475569;">${summary}</p>` : ""}
               ${
                 item.url
-                  ? `<table role="presentation" cellspacing="0" cellpadding="0"><tr><td style="border-radius:999px;background:#0f766e;"><a href="${escapeHtml(item.url)}" style="display:inline-block;padding:9px 14px;font-size:13px;line-height:18px;color:#ffffff;font-weight:700;text-decoration:none;">Read the post</a></td></tr></table>`
+                  ? `<table role="presentation" cellspacing="0" cellpadding="0"><tr><td style="border-radius:999px;background:#059669;"><a href="${escapeHtml(item.url)}" style="display:inline-block;padding:9px 14px;font-size:13px;line-height:18px;color:#ffffff;font-weight:700;text-decoration:none;">Read the post</a></td></tr></table>`
                   : ""
               }
             </td>
@@ -74,7 +74,7 @@ export function renderHtml(issue: DigestIssue) {
   }
   if (issue.unsubscribeUrl) {
     footerBits.push(
-      `<p style="margin:0;font-size:12px;line-height:19px;color:#64748b;"><a href="${escapeHtml(issue.unsubscribeUrl)}" style="color:#0f766e;text-decoration:underline;">Unsubscribe</a></p>`,
+      `<p style="margin:0;font-size:12px;line-height:19px;color:#64748b;"><a href="${escapeHtml(issue.unsubscribeUrl)}" style="color:#059669;text-decoration:underline;">Unsubscribe</a></p>`,
     );
   } else {
     footerBits.push(
@@ -98,14 +98,14 @@ export function renderHtml(issue: DigestIssue) {
           <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:680px;">
             <tr>
               <td style="padding:0 0 14px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="overflow:hidden;border-radius:22px;background:#0f172a;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="overflow:hidden;border-radius:22px;background:#0b0b0c;">
                   <tr>
-                    <td style="padding:8px;background:#14b8a6;"></td>
+                    <td style="padding:8px;background:#10b981;"></td>
                   </tr>
                   <tr>
                     <td style="padding:34px 30px 30px;">
                       <div style="margin-bottom:18px;">
-                        <span style="display:inline-block;border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:7px 10px;font-size:12px;line-height:16px;color:#ccfbf1;font-weight:700;">${escapeHtml(issue.sourceLabel)}</span>
+                        <span style="display:inline-block;border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:7px 10px;font-size:12px;line-height:16px;color:#d1fae5;font-weight:700;">${escapeHtml(issue.sourceLabel)}</span>
                         <span style="display:inline-block;margin-left:8px;border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:7px 10px;font-size:12px;line-height:16px;color:#cbd5e1;">${escapeHtml(itemCount)}</span>
                       </div>
                       <h1 style="margin:0 0 14px;font-size:34px;line-height:42px;color:#ffffff;font-weight:800;">${title}</h1>
