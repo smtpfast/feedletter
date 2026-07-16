@@ -1,7 +1,7 @@
 {
   "name": "feedletter",
-  "version": "0.1.0",
-  "description": "Generate clean email digests from RSS feeds or local Markdown content.",
+  "version": "0.2.0",
+  "description": "Turn an RSS feed or Markdown folder into a newsletter: curate in a browser studio and send with SMTPfast.",
   "type": "module",
   "bin": {
     "feedletter": "./dist/cli.js"
@@ -16,6 +16,7 @@
     "build": "tsc",
     "dev": "tsx src/cli.ts",
     "preview": "tsx src/cli.ts preview",
+    "studio": "tsx src/cli.ts studio",
     "test": "vitest run",
     "check": "tsc --noEmit"
   },
@@ -25,9 +26,19 @@
     "rss",
     "markdown",
     "digest",
-    "template"
+    "template",
+    "smtpfast",
+    "studio"
   ],
-  "author": "Feedletter contributors",
+  "homepage": "https://github.com/smtpfast/feedletter#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smtpfast/feedletter.git"
+  },
+  "bugs": {
+    "url": "https://github.com/smtpfast/feedletter/issues"
+  },
+  "author": "SMTPfast",
   "license": "MIT",
   "engines": {
     "node": ">=20"
