@@ -162,10 +162,16 @@ program
   .option("--from <email>", "Default sender address for the send panel")
   .option("--history-db <path>", "SQLite file used to flag and skip previously sent items", ".feedletter/feedletter.sqlite")
   .option("--no-history", "Do not track or flag previously sent items")
+  .option("--agent-command <command>", "Use an external writer (e.g. \"claude -p\" or \"codex\") for Improve, instead of the AI API")
+  .option("--agent-timeout <ms>", "External writer command timeout", "120000")
   .action(async (options) => {
     try {
       const port = Number.parseInt(options.port, 10);
       if (!Number.isFinite(port) || port < 1) throw new Error("--port must be a positive number.");
+      const agentTimeoutMs = Number.parseInt(options.agentTimeout, 10);
+      if (options.agentCommand && (!Number.isFinite(agentTimeoutMs) || agentTimeoutMs < 1000)) {
+        throw new Error("--agent-timeout must be at least 1000ms.");
+      }
       await startStudioServer({
         host: options.host,
         port,
@@ -174,6 +180,8 @@ program
         defaultFrom: options.from,
         historyDb: options.historyDb,
         history: options.history,
+        agentCommand: options.agentCommand,
+        agentTimeoutMs,
       });
       console.log(`Feedletter Studio running at http://${options.host}:${port}`);
     } catch (error) {

@@ -8,6 +8,7 @@ import { loadRssFeed } from "./rss.js";
 import { parseRecipients, sendDigest, verifyFromDomain, SMTPFAST_DEFAULT_BASE_URL, SMTPFAST_SIGNUP_URL, UNSUBSCRIBE_PLACEHOLDER } from "./smtpfast.js";
 import { renderStudioPage } from "./studio-ui.js";
 import type { DigestIssue, SourceItem } from "./types.js";
+import { enrichIssueWithCommand } from "./writer.js";
 
 export interface StudioOptions {
   host: string;
@@ -17,6 +18,8 @@ export interface StudioOptions {
   defaultFrom?: string;
   historyDb?: string;
   history?: boolean;
+  agentCommand?: string;
+  agentTimeoutMs?: number;
 }
 
 interface ServerContext extends StudioOptions {
@@ -151,25 +154,30 @@ async function handleRender(req: IncomingMessage, res: ServerResponse) {
 }
 
 async function handleEnrich(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
-  if (!ctx.aiEnabled) {
+  if (!ctx.agentCommand && !ctx.aiEnabled) {
     return sendJson(res, 400, {
-      error: "AI is not configured. Set OPENAI_API_KEY (or AI_API_KEY) and AI_MODEL, then restart studio.",
+      error:
+        "No writer configured. Set OPENAI_API_KEY (or AI_API_KEY) + AI_MODEL for the API, or pass --agent-command \"claude -p\", then restart studio.",
     });
   }
   const draft = await readJson<Record<string, unknown>>(req);
   const tone = toStringField(draft.tone) || "clear, useful, developer-friendly";
   const source = issueFromDraft(draft);
   const fallback = buildFallbackIssue(source.title, source.intro, source.sourceLabel, source.items, source.instructions);
-  const enriched = await enrichIssueWithAi(
-    { ...fallback, preheader: source.preheader || fallback.preheader },
-    {
-      enabled: true,
-      baseUrl: ctx.aiBaseUrl,
-      apiKey: process.env.OPENAI_API_KEY ?? process.env.AI_API_KEY,
-      model: ctx.aiModel,
-      tone,
-    },
-  );
+  const base: DigestIssue = { ...fallback, preheader: source.preheader || fallback.preheader };
+
+  // The external agent command (claude -p, codex, a custom script) takes
+  // precedence when configured, so a user can opt out of the API entirely.
+  const enriched = ctx.agentCommand
+    ? await enrichIssueWithCommand(base, ctx.agentCommand, tone, ctx.agentTimeoutMs ?? 120000)
+    : await enrichIssueWithAi(base, {
+        enabled: true,
+        baseUrl: ctx.aiBaseUrl,
+        apiKey: process.env.OPENAI_API_KEY ?? process.env.AI_API_KEY,
+        model: ctx.aiModel,
+        tone,
+      });
+
   return sendJson(res, 200, {
     title: enriched.title,
     preheader: enriched.preheader,
@@ -240,8 +248,18 @@ export async function startStudioServer(options: StudioOptions) {
     }
   }
 
+  const writerLabel = ctx.agentCommand
+    ? /claude/i.test(ctx.agentCommand)
+      ? "Claude"
+      : /codex/i.test(ctx.agentCommand)
+        ? "Codex"
+        : "your agent"
+    : ctx.aiEnabled
+      ? "AI"
+      : null;
+
   const page = renderStudioPage({
-    aiEnabled: ctx.aiEnabled,
+    writerLabel,
     defaultFrom: options.defaultFrom ?? "",
     defaultContentDir: options.contentDir ?? "",
     signupUrl: SMTPFAST_SIGNUP_URL,

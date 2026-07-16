@@ -1,5 +1,5 @@
 export interface StudioPageConfig {
-  aiEnabled: boolean;
+  writerLabel: string | null;
   defaultFrom: string;
   defaultContentDir: string;
   signupUrl: string;
@@ -91,8 +91,8 @@ export function renderStudioPage(config: StudioPageConfig): string {
             <input id="footerNote" type="text" placeholder="You are getting this because you subscribed at example.com" />
           </label>
           <div class="ai-row">
-            <button id="improveBtn" class="btn ghost" type="button" ${config.aiEnabled ? "" : "disabled"}>✨ Improve with AI</button>
-            ${config.aiEnabled ? "" : '<span class="hint">Set OPENAI_API_KEY + AI_MODEL to enable</span>'}
+            <button id="improveBtn" class="btn ghost" type="button" ${config.writerLabel ? "" : "disabled"}>✨ Improve with ${escapeHtml(config.writerLabel ?? "AI")}</button>
+            ${config.writerLabel ? "" : '<span class="hint">Set OPENAI_API_KEY + AI_MODEL, or pass --agent-command</span>'}
           </div>
         </div>
       </section>

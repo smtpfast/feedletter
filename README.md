@@ -91,7 +91,9 @@ In the studio you can:
 - see an **already sent** badge on items from a previous issue, so you never
   send the same post twice (tracked in the same SQLite history as `build`)
 - edit the subject, preheader, intro, and an optional footer note
-- polish the copy with **Improve with AI** (uses your own key, server-side)
+- polish the copy with **Improve** (uses your own AI key server-side, or an
+  external writer like `claude -p` or `codex` when you start studio with
+  `--agent-command`, so you can skip the API entirely)
 - watch a live email and plain-text preview as you go
 - send with **SMTPfast**: paste an API key and a verified sender, and Feedletter
   checks the sender domain is verified, lets you send a test to yourself first,
