@@ -5,7 +5,11 @@ import { asArray, cleanText, normalizeUrl, sortByDateDesc } from "./utils.js";
 interface LoadRssOptions {
   url: string;
   limit: number;
+  timeoutMs?: number;
 }
+
+const DEFAULT_TIMEOUT_MS = 15000;
+const USER_AGENT = "feedletter/0.2 (+https://github.com/smtpfast/feedletter)";
 
 const parser = new XMLParser({
   ignoreAttributes: false,
@@ -42,9 +46,27 @@ function records(value: unknown): Record<string, unknown>[] {
 }
 
 export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]> {
-  const response = await fetch(options.url, {
-    headers: { accept: "application/rss+xml, application/atom+xml, application/xml, text/xml" },
-  });
+  const controller = new AbortController();
+  const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  let response: Response;
+  try {
+    response = await fetch(options.url, {
+      headers: {
+        accept: "application/rss+xml, application/atom+xml, application/xml, text/xml",
+        "user-agent": USER_AGENT,
+      },
+      signal: controller.signal,
+    });
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      throw new Error(`RSS fetch timed out after ${timeoutMs}ms: ${options.url}`);
+    }
+    throw new Error(`RSS fetch failed for ${options.url}: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    clearTimeout(timer);
+  }
 
   if (!response.ok) {
     throw new Error(`RSS fetch failed with ${response.status} ${response.statusText}`);
