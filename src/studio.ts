@@ -2,9 +2,10 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
+import { HistoryStore, itemHistoryKey } from "./history.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
-import { parseRecipients, sendDigest, SMTPFAST_DEFAULT_BASE_URL, SMTPFAST_SIGNUP_URL, UNSUBSCRIBE_PLACEHOLDER } from "./smtpfast.js";
+import { parseRecipients, sendDigest, verifyFromDomain, SMTPFAST_DEFAULT_BASE_URL, SMTPFAST_SIGNUP_URL, UNSUBSCRIBE_PLACEHOLDER } from "./smtpfast.js";
 import { renderStudioPage } from "./studio-ui.js";
 import type { DigestIssue, SourceItem } from "./types.js";
 
@@ -14,12 +15,15 @@ export interface StudioOptions {
   contentDir?: string;
   baseUrl?: string;
   defaultFrom?: string;
+  historyDb?: string;
+  history?: boolean;
 }
 
 interface ServerContext extends StudioOptions {
   aiEnabled: boolean;
   aiBaseUrl: string;
   aiModel?: string;
+  historyStore?: HistoryStore;
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
@@ -107,7 +111,7 @@ async function handleLoad(req: IncomingMessage, res: ServerResponse, ctx: Server
     } catch {
       /* keep default */
     }
-    return sendJson(res, 200, { items, sourceLabel });
+    return sendJson(res, 200, { items: withSeen(items, ctx), sourceLabel });
   }
 
   const dir = toStringField(body.content).trim() || ctx.contentDir;
@@ -117,7 +121,27 @@ async function handleLoad(req: IncomingMessage, res: ServerResponse, ctx: Server
     baseUrl: toStringField(body.baseUrl).trim() || ctx.baseUrl,
     limit,
   });
-  return sendJson(res, 200, { items, sourceLabel: "Local content" });
+  return sendJson(res, 200, { items: withSeen(items, ctx), sourceLabel: "Local content" });
+}
+
+function withSeen(items: SourceItem[], ctx: ServerContext): Array<SourceItem & { seen?: boolean }> {
+  if (!ctx.historyStore) return items;
+  const seen = ctx.historyStore.seenKeys(items);
+  return items.map((item) => ({ ...item, seen: seen.has(itemHistoryKey(item)) }));
+}
+
+async function handleVerifyDomain(req: IncomingMessage, res: ServerResponse) {
+  const body = await readJson<Record<string, unknown>>(req);
+  const apiKey = toStringField(body.apiKey).trim();
+  const from = toStringField(body.from).trim();
+  const baseUrl = toStringField(body.baseUrl).trim() || SMTPFAST_DEFAULT_BASE_URL;
+  if (!apiKey || !from) return sendJson(res, 400, { error: "API key and From address are required." });
+  try {
+    const check = await verifyFromDomain({ apiKey, baseUrl }, from);
+    return sendJson(res, 200, check);
+  } catch (error) {
+    return sendJson(res, 502, { error: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 async function handleRender(req: IncomingMessage, res: ServerResponse) {
@@ -154,7 +178,7 @@ async function handleEnrich(req: IncomingMessage, res: ServerResponse, ctx: Serv
   });
 }
 
-async function handleSend(req: IncomingMessage, res: ServerResponse) {
+async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
   const body = await readJson<Record<string, unknown>>(req);
   const apiKey = toStringField(body.apiKey).trim();
   const from = toStringField(body.from).trim();
@@ -163,15 +187,39 @@ async function handleSend(req: IncomingMessage, res: ServerResponse) {
   const html = toStringField(body.html);
   const text = toStringField(body.text);
   const baseUrl = toStringField(body.baseUrl).trim() || SMTPFAST_DEFAULT_BASE_URL;
+  const isTest = body.test === true;
 
   if (!apiKey) return sendJson(res, 400, { error: "Paste your SMTPfast API key." });
   if (!from) return sendJson(res, 400, { error: "Enter a verified sender address." });
   if (!subject) return sendJson(res, 400, { error: "Add a subject line." });
-  if (recipients.length === 0) return sendJson(res, 400, { error: "Add at least one recipient." });
+  if (recipients.length === 0) {
+    return sendJson(res, 400, { error: isTest ? "Enter a test address." : "Add at least one recipient." });
+  }
   if (!html) return sendJson(res, 400, { error: "Nothing to send yet. Load a source first." });
 
   const results = await sendDigest({ apiKey, baseUrl }, { from, subject, html, text }, recipients);
   const sent = results.filter((r) => r.ok).length;
+
+  // Record a real send in history so the same items are not sent twice. Test
+  // sends never touch history.
+  if (!isTest && sent > 0 && ctx.historyStore) {
+    const items = normalizeItems(body.items);
+    if (items.length > 0) {
+      try {
+        await ctx.historyStore.recordIssue({
+          title: subject,
+          preheader: "",
+          intro: "",
+          items,
+          generatedAt: new Date().toISOString(),
+          sourceLabel: toStringField(body.sourceLabel, "Digest"),
+        });
+      } catch {
+        /* history is best-effort; never fail a send over it */
+      }
+    }
+  }
+
   return sendJson(res, 200, { sent, failed: results.length - sent, results });
 }
 
@@ -183,12 +231,22 @@ export async function startStudioServer(options: StudioOptions) {
     aiModel: process.env.AI_MODEL,
   };
 
+  if (options.history !== false) {
+    try {
+      ctx.historyStore = await HistoryStore.open(path.resolve(options.historyDb ?? ".feedletter/feedletter.sqlite"));
+    } catch {
+      // History is optional. If sql.js cannot initialize, run without dedup.
+      ctx.historyStore = undefined;
+    }
+  }
+
   const page = renderStudioPage({
     aiEnabled: ctx.aiEnabled,
     defaultFrom: options.defaultFrom ?? "",
     defaultContentDir: options.contentDir ?? "",
     signupUrl: SMTPFAST_SIGNUP_URL,
     unsubscribePlaceholder: UNSUBSCRIBE_PLACEHOLDER,
+    historyEnabled: Boolean(ctx.historyStore),
   });
 
   const server = createServer(async (req, res) => {
@@ -202,7 +260,8 @@ export async function startStudioServer(options: StudioOptions) {
       if (req.method === "POST" && url.pathname === "/api/load") return void (await handleLoad(req, res, ctx));
       if (req.method === "POST" && url.pathname === "/api/render") return void (await handleRender(req, res));
       if (req.method === "POST" && url.pathname === "/api/enrich") return void (await handleEnrich(req, res, ctx));
-      if (req.method === "POST" && url.pathname === "/api/send") return void (await handleSend(req, res));
+      if (req.method === "POST" && url.pathname === "/api/verify-domain") return void (await handleVerifyDomain(req, res));
+      if (req.method === "POST" && url.pathname === "/api/send") return void (await handleSend(req, res, ctx));
 
       sendJson(res, 404, { error: "Not found" });
     } catch (error) {

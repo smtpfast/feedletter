@@ -160,6 +160,8 @@ program
   .option("--content <dir>", "Default local Markdown/MDX content directory")
   .option("--base-url <url>", "Default base URL for relative Markdown slugs")
   .option("--from <email>", "Default sender address for the send panel")
+  .option("--history-db <path>", "SQLite file used to flag and skip previously sent items", ".feedletter/feedletter.sqlite")
+  .option("--no-history", "Do not track or flag previously sent items")
   .action(async (options) => {
     try {
       const port = Number.parseInt(options.port, 10);
@@ -170,6 +172,8 @@ program
         contentDir: options.content,
         baseUrl: options.baseUrl,
         defaultFrom: options.from,
+        historyDb: options.historyDb,
+        history: options.history,
       });
       console.log(`Feedletter Studio running at http://${options.host}:${port}`);
     } catch (error) {
