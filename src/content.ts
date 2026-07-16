@@ -55,6 +55,11 @@ export async function loadContentDirectory(options: LoadContentOptions): Promise
       date: frontmatterString(data, ["date", "publishedAt", "createdAt", "updatedAt"]),
       author: frontmatterString(data, ["author"]),
       source: "content",
+      image: normalizeUrl(
+        frontmatterString(data, ["image", "cover", "coverImage", "ogImage", "thumbnail"]) ??
+          parsed.content.match(/!\[[^\]]*]\((https?:\/\/[^)\s]+)\)/)?.[1],
+        options.baseUrl,
+      ),
     } satisfies SourceItem;
   });
 

@@ -45,6 +45,35 @@ function records(value: unknown): Record<string, unknown>[] {
   );
 }
 
+function imageUrlFrom(value: unknown): string | undefined {
+  for (const entry of asArray(value)) {
+    if (entry && typeof entry === "object") {
+      const url = (entry as Record<string, unknown>).url;
+      if (typeof url === "string" && /^https?:\/\//i.test(url)) return url;
+    }
+  }
+  return undefined;
+}
+
+function imageFromHtml(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    if (typeof value === "string") {
+      const match = value.match(/<img[^>]+src=["']([^"']+)["']/i);
+      if (match && /^https?:\/\//i.test(match[1])) return match[1];
+    }
+  }
+  return undefined;
+}
+
+function firstImage(item: Record<string, unknown>): string | undefined {
+  return (
+    imageUrlFrom(item["media:content"]) ??
+    imageUrlFrom(item["media:thumbnail"]) ??
+    imageUrlFrom(item.enclosure) ??
+    imageFromHtml(item["content:encoded"], item.description, item.content, item.summary)
+  );
+}
+
 export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]> {
   const controller = new AbortController();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
@@ -87,6 +116,7 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
         date: firstText(item.pubDate, item.isoDate),
         author: firstText(item.author, item["dc:creator"]),
         source: options.url,
+        image: firstImage(item),
       })),
     ).slice(0, options.limit);
   }
@@ -101,6 +131,7 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
         date: firstText(entry.updated, entry.published),
         author: firstText((entry.author as { name?: unknown } | undefined)?.name),
         source: options.url,
+        image: firstImage(entry),
       })),
     ).slice(0, options.limit);
   }

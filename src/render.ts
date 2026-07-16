@@ -38,11 +38,16 @@ function renderItem(item: SourceItem) {
   const titleHtml = item.url
     ? `<a href="${escapeHtml(item.url)}" style="color:#111827;text-decoration:none;">${title}</a>`
     : title;
+  const image = item.image && /^https?:\/\//i.test(item.image) ? escapeHtml(item.image) : "";
+  const imageHtml = image
+    ? `<a href="${item.url ? escapeHtml(item.url) : "#"}" style="text-decoration:none;"><img src="${image}" alt="" width="600" style="display:block;width:100%;height:auto;border-radius:16px 16px 0 0;" /></a>`
+    : "";
 
   return `
     <tr>
       <td style="padding:0 0 14px;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-radius:16px;background:#ffffff;">
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-radius:16px;background:#ffffff;overflow:hidden;">
+          ${imageHtml ? `<tr><td style="padding:0;">${imageHtml}</td></tr>` : ""}
           <tr>
             <td style="padding:20px 20px 18px;">
               ${meta ? `<div style="margin-bottom:10px;font-size:12px;line-height:18px;color:#64748b;">${escapeHtml(meta)}</div>` : ""}

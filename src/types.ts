@@ -6,6 +6,7 @@ export interface SourceItem {
   date?: string;
   author?: string;
   source?: string;
+  image?: string;
 }
 
 export interface DigestIssue {
