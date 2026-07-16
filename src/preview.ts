@@ -126,7 +126,7 @@ function previewShell(issueJson: string, text: string) {
         document.getElementById(tabId).addEventListener("click", () => {
           for (const [otherTab, otherPanel] of tabs) {
             document.getElementById(otherTab).classList.toggle("active", otherTab === tabId);
-            document.getElementById(otherPanel).style.display = otherPanel === panelId ? (otherPanel === "emailPanel" ? "block" : "block") : "none";
+            document.getElementById(otherPanel).style.display = otherPanel === panelId ? "block" : "none";
           }
         });
       }
