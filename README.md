@@ -73,6 +73,71 @@ feedletter preview --dir dist/feedletter --port 4173
 
 Then open `http://127.0.0.1:4173`.
 
+## CLI Reference
+
+Every command also supports `--help`. The top-level command supports `--version`.
+
+### `feedletter build`
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--rss <url>` | — | RSS or Atom feed URL. Provide this or `--content`. |
+| `--content <dir>` | — | Local Markdown/MDX content directory. Provide this or `--rss`. |
+| `--base-url <url>` | — | Base URL for relative Markdown slugs. |
+| `--out <dir>` | `dist/feedletter` | Output directory for the generated issue. |
+| `--limit <number>` | `5` | Number of items to include. |
+| `--title <title>` | `Latest updates` | Digest subject and title. |
+| `--description <text>` | — | Intro copy displayed before the item list. |
+| `--source-label <label>` | source hostname or `Local content` | Small label displayed above the title. |
+| `--instructions <file>` | — | Markdown file with voice, audience, sponsor, or editorial instructions. |
+| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to skip previously included items. |
+| `--no-history` | history enabled | Do not read or write item history. |
+| `--include-seen` | off | Allow items already present in the history database. |
+| `--no-record-history` | history is recorded | Do not mark generated items as included after a successful build. |
+| `--ai` | off | Use an OpenAI-compatible API to improve the subject, preheader, and intro. |
+| `--ai-base-url <url>` | `AI_BASE_URL`, or `https://api.openai.com/v1` | AI API base URL. |
+| `--ai-model <model>` | `AI_MODEL` | AI model name. |
+| `--agent-command <command>` | — | External writer command that receives the editorial prompt on stdin and prints JSON. Cannot be used with `--ai`. |
+| `--agent-timeout <ms>` | `120000` | Timeout for the external writer command. |
+| `--tone <tone>` | `clear, useful, developer-friendly` | Writing tone used by AI or the external writer. |
+
+### `feedletter preview`
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--dir <dir>` | `dist/feedletter` | Directory containing `email.html`, `email.txt`, and `issue.json`. |
+| `--host <host>` | `127.0.0.1` | Host address for the preview server. |
+| `--port <number>` | `4173` | Port for the preview server. |
+
+### `feedletter studio`
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--host <host>` | `127.0.0.1` | Host address for the studio server. |
+| `--port <number>` | `4180` | Port for the studio server. |
+| `--content <dir>` | — | Default local Markdown/MDX content directory. |
+| `--base-url <url>` | — | Default base URL for relative Markdown slugs. |
+| `--from <email>` | — | Default sender address in the send panel. |
+| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to flag and skip previously sent items. |
+| `--no-history` | history enabled | Do not track or flag previously sent items. |
+| `--agent-command <command>` | — | Use an external writer, such as `claude -p` or `codex`, for Improve instead of the AI API. |
+| `--agent-timeout <ms>` | `120000` | Timeout for the external writer command. |
+
+### `feedletter send`
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from <email>` | required | Verified sender, for example `Weekly <news@yourdomain.com>`. |
+| `--dir <dir>` | `dist/feedletter` | Build output directory containing `issue.json`. |
+| `--to <list>` | — | Recipients separated by commas, spaces, or newlines. |
+| `--to-file <path>` | — | File containing one recipient per line; lines beginning with `#` are ignored. |
+| `--footer <text>` | issue footer | Footer note displayed above the unsubscribe link. |
+| `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
+| `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
+| `--test` | off | Send only to the first recipient and do not record history. |
+| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items. |
+| `--no-history` | history enabled | Do not record sent items in history. |
+
 ## Studio
 
 The studio is the fastest way to go from a feed to a sent issue. Start it and
