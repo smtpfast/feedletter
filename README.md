@@ -190,10 +190,32 @@ SMTPFAST_API_KEY=sf_... feedletter send \
 ```
 
 Add `--test` to send only to the first recipient. Pair the two commands with a
-scheduled GitHub Action to send every week automatically. A ready-to-copy
-workflow is in [`examples/github-actions-newsletter.yml`](examples/github-actions-newsletter.yml):
-it builds on a cron schedule, sends with SMTPfast, and commits the history file
-back so the same post is never sent twice.
+scheduled GitHub Action to send every week automatically.
+
+### GitHub Actions
+
+The repo ships a reusable composite action. Add a workflow that calls it:
+
+```yaml
+- name: Run Feedletter
+  uses: smtpfast/feedletter@main
+  with:
+    rss: https://your-blog.example.com/rss.xml
+    title: "This week from the blog"
+    from: "Weekly <news@yourdomain.com>"
+    to-file: recipients.txt
+    smtpfast-api-key: ${{ secrets.SMTPFAST_API_KEY }}
+```
+
+**Required secret:** `SMTPFAST_API_KEY` (from the
+[SMTPfast dashboard](https://smtpfa.st)).
+
+A ready-to-copy workflow is in
+[`examples/github-action.yml`](examples/github-action.yml): it runs on a weekly
+cron, sends with SMTPfast, and commits the history file back so the same post
+is never sent twice. A standalone copy-paste version without the composite
+action is at
+[`examples/github-actions-newsletter.yml`](examples/github-actions-newsletter.yml).
 
 ## Sending with SMTPfast
 
@@ -334,7 +356,6 @@ with `--base-url`.
 
 - Custom template files
 - Multiple layout presets
-- GitHub Action example
 - Direct export for common email providers
 - Content deduping by previously sent URLs
 - Optional image extraction
