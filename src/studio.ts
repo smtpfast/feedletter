@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { lookup } from "node:dns/promises";
 import { isIP } from "node:net";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
@@ -63,16 +64,32 @@ export function isLoopbackHost(host: string) {
 }
 
 /**
+ * Whether the Host check applies: the bind address resolves to a loopback
+ * address (127.1 and 2130706433 do), or it cannot be resolved (fail closed).
+ * Binding to a non-loopback address such as 0.0.0.0 is an explicit opt-in.
+ */
+export async function bindNeedsHostGuard(bindHost: string): Promise<boolean> {
+  const host = normalizeHost(bindHost);
+  if (isLoopbackHost(host)) return true;
+  if (isIP(host)) return false;
+  try {
+    const addresses = await lookup(host, { all: true });
+    return addresses.length === 0 || addresses.some((entry) => isLoopbackHost(entry.address));
+  } catch {
+    return true;
+  }
+}
+
+/**
  * The studio is a local tool that can read local folders, run the writer
  * command, and send email, so only the studio page itself may call its API.
  * Returns an error message for a request a web page elsewhere could make.
  */
-export function rejectForeignRequest(req: IncomingMessage, bindHost: string): string | undefined {
+export function rejectForeignRequest(req: IncomingMessage, hostGuard: boolean): string | undefined {
   const host = hostnameOf(req.headers.host);
   // On a loopback bind, a Host that is not a loopback name means DNS rebinding.
-  // Binding to another interface is an explicit opt-in, so any Host is accepted
-  // there; the Origin and content-type checks below still apply.
-  if (isLoopbackHost(bindHost) && !isLoopbackHost(host)) return "Unknown host.";
+  // The Origin and content-type checks below apply to every bind.
+  if (hostGuard && !isLoopbackHost(host)) return "Unknown host.";
   if (req.method !== "POST") return undefined;
   const origin = req.headers.origin;
   if (origin) {
@@ -326,10 +343,11 @@ export async function startStudioServer(options: StudioOptions) {
     historyEnabled: Boolean(ctx.historyStore),
   });
 
+  const hostGuard = await bindNeedsHostGuard(options.host);
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${options.host}:${options.port}`);
     try {
-      const rejection = rejectForeignRequest(req, options.host);
+      const rejection = rejectForeignRequest(req, hostGuard);
       if (rejection) return void sendJson(res, 403, { error: rejection });
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
