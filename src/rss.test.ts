@@ -234,6 +234,23 @@ describe("loadRssFeed text and link handling", () => {
     expect(rss.title).toBe("Escaping &lt; in XML");
   });
 
+  it("keeps mixed text and CDATA in order and decodes each part by its kind", async () => {
+    mockFetch(`<rss version="2.0"><channel><item>
+      <title>A &amp;lt; <![CDATA[B &amp; C]]> D &#8217;<!-- note --></title>
+      <link>https://example.com/m</link>
+      <description>&lt;p&gt;one &amp;amp;&lt;/p&gt;<![CDATA[<p>two &amp; three</p>]]></description>
+    </item></channel></rss>`);
+    const [rss] = await loadRssFeed({ url: "https://example.com/feed.xml", limit: 5 });
+    expect(rss.title).toBe("A &lt; B & C D \u2019");
+    expect(rss.summary).toBe("one & two & three");
+
+    mockFetch(`<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <title>X &amp;lt; <![CDATA[&amp; Y]]></title><link href="https://example.com/x" />
+    </entry></feed>`);
+    const [atom] = await loadRssFeed({ url: "https://example.com/atom.xml", limit: 5 });
+    expect(atom.title).toBe("X &lt; &amp; Y");
+  });
+
   it("reduces a malicious summary to harmless text", async () => {
     mockFetch(`<rss version="2.0"><channel><item><title>Hi</title><link>https://example.com/h</link>
       <description><![CDATA[<script>alert(1)</script><img src=x onerror="alert(1)"><a href="javascript:alert(1)">click</a> &lt;script&gt;alert(2)&lt;/script&gt;]]></description>

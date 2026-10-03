@@ -9,6 +9,7 @@ let dir: string;
 beforeAll(async () => {
   dir = await mkdtemp(path.join(tmpdir(), "feedletter-content-"));
   await writeFile(path.join(dir, "dated.md"), "---\ntitle: Dated\ndate: 2026-05-30\n---\nA self-hosted runner, step by step.");
+  await writeFile(path.join(dir, "timed.md"), "---\ntitle: Timed\ndate: 2026-05-29T00:00:00Z\n---\nBody.");
 });
 
 afterAll(async () => {
@@ -17,9 +18,15 @@ afterAll(async () => {
 
 describe("loadContentDirectory", () => {
   it("keeps a YAML date as a plain calendar date", async () => {
-    const [item] = await loadContentDirectory({ dir, limit: 5 });
+    const items = await loadContentDirectory({ dir, limit: 5 });
+    const item = items.find((i) => i.title === "Dated")!;
     expect(item.date).toBe("2026-05-30");
     expect(item.summary).toBe("A self-hosted runner, step by step.");
+  });
+
+  it("keeps the time of an unquoted YAML timestamp, midnight included", async () => {
+    const items = await loadContentDirectory({ dir, limit: 5 });
+    expect(items.find((i) => i.title === "Timed")!.date).toBe("2026-05-29T00:00:00.000Z");
   });
 
   it("explains a missing directory", async () => {

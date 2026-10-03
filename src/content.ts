@@ -17,15 +17,20 @@ function slugFromFile(filePath: string) {
   return path.basename(filePath).replace(/\.(md|mdx)$/i, "");
 }
 
-function frontmatterString(data: Record<string, unknown>, keys: string[]) {
+function escapeRegExp(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function frontmatterString(data: Record<string, unknown>, keys: string[], rawFrontmatter = "") {
   for (const key of keys) {
     const value = data[key];
     if (typeof value === "string" && value.trim()) return value.trim();
     if (value instanceof Date && !Number.isNaN(value.getTime())) {
-      // YAML turns `date: 2026-05-30` into midnight UTC. Keep it a plain date so
-      // it does not render as the day before in time zones west of UTC.
-      const iso = value.toISOString();
-      return iso.endsWith("T00:00:00.000Z") ? iso.slice(0, 10) : iso;
+      // YAML turns both `2026-05-30` and `2026-05-30T00:00:00Z` into a Date.
+      // Only a bare calendar date stays a plain date (so it does not show as
+      // the day before west of UTC); a timestamp keeps its time.
+      const bareDate = new RegExp(`^${escapeRegExp(key)}\\s*:\\s*(\\d{4}-\\d{2}-\\d{2})\\s*(?:#.*)?$`, "m").exec(rawFrontmatter);
+      return bareDate ? bareDate[1] : value.toISOString();
     }
   }
   return undefined;
@@ -70,7 +75,7 @@ export async function loadContentDirectory(options: LoadContentOptions): Promise
         frontmatterString(data, ["description", "summary", "excerpt"]) ??
         excerpt(parsed.content),
       content: parsed.content,
-      date: frontmatterString(data, ["date", "publishedAt", "createdAt", "updatedAt"]),
+      date: frontmatterString(data, ["date", "publishedAt", "createdAt", "updatedAt"], parsed.matter),
       author: frontmatterString(data, ["author"]),
       source: "content",
       image: normalizeUrl(

@@ -12,9 +12,10 @@ const DEFAULT_TIMEOUT_MS = 15000;
 const SUMMARY_MAX_LENGTH = 300;
 const USER_AGENT = "feedletter/0.2 (+https://github.com/smtpfast/feedletter)";
 
-// htmlEntities makes the parser decode character references (&#8217;) and
-// named entities exactly once, as XML requires. CDATA is kept apart so text
-// that arrives as raw HTML can be told from text that was already decoded.
+// Text fields are kept as raw XML (stopNodes) so text and CDATA can be read
+// in order, each decoded by its own kind. Everything else (links, dates, guids)
+// is decoded by the parser, once: htmlEntities covers &#8217; and named entities.
+const TEXT_FIELDS = ["title", "description", "content:encoded", "summary", "content", "dc:creator", "name"];
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "",
@@ -22,16 +23,36 @@ const parser = new XMLParser({
   cdataPropName: "__cdata",
   htmlEntities: true,
   parseTagValue: false,
+  stopNodes: TEXT_FIELDS.map((tag) => `*.${tag}`),
 });
 
-interface TextNode {
+interface Segment {
   text: string;
-  /** The text came from a CDATA section, so entities in it were not decoded. */
+  /** From a CDATA section: entities in it were not decoded. */
   cdata: boolean;
+}
+
+interface TextNode {
+  segments: Segment[];
   /** Atom's type attribute: text (the default), html, or xhtml. */
   type?: string;
 }
 
+/** Split a raw text field into text and CDATA segments, in order. Text is decoded once; comments are dropped. */
+function segmentsOf(raw: string): Segment[] {
+  const segments: Segment[] = [];
+  const pattern = /<!\[CDATA\[([\s\S]*?)\]\]>|<!--[\s\S]*?-->/g;
+  let last = 0;
+  for (let match = pattern.exec(raw); match; match = pattern.exec(raw)) {
+    if (match.index > last) segments.push({ text: decodeEntities(raw.slice(last, match.index)), cdata: false });
+    if (match[1] !== undefined) segments.push({ text: match[1], cdata: true });
+    last = pattern.lastIndex;
+  }
+  if (last < raw.length) segments.push({ text: decodeEntities(raw.slice(last)), cdata: false });
+  return segments;
+}
+
+/** A raw text field (see TEXT_FIELDS), as a string or { text, type }. */
 function textNode(value: unknown): TextNode | undefined {
   if (Array.isArray(value)) {
     for (const entry of value) {
@@ -40,16 +61,10 @@ function textNode(value: unknown): TextNode | undefined {
     }
     return undefined;
   }
-  if (typeof value === "string") return value.trim() ? { text: value.trim(), cdata: false } : undefined;
-  if (typeof value === "object" && value !== null) {
-    const record = value as Record<string, unknown>;
-    const cdata = asArray(record.__cdata).filter((part) => typeof part === "string").join("");
-    const text = typeof record.text === "string" ? record.text : "";
-    const combined = `${text}${cdata}`.trim();
-    if (!combined) return undefined;
-    return { text: combined, cdata: cdata.trim() !== "", type: typeof record.type === "string" ? record.type.toLowerCase() : undefined };
-  }
-  return undefined;
+  const record = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : undefined;
+  const raw = typeof value === "string" ? value : typeof record?.text === "string" ? record.text : "";
+  if (!raw.trim()) return undefined;
+  return { segments: segmentsOf(raw), type: typeof record?.type === "string" ? record.type.toLowerCase() : undefined };
 }
 
 function firstNode(...values: unknown[]) {
@@ -60,22 +75,35 @@ function firstNode(...values: unknown[]) {
   return undefined;
 }
 
-function firstText(...values: unknown[]) {
-  return firstNode(...values)?.text;
+/** The markup a field holds: decoded text and raw CDATA, joined in order. */
+function htmlSource(node: TextNode | undefined) {
+  return node ? node.segments.map((segment) => segment.text).join("") : "";
+}
+
+/** A field the parser decoded (link, guid, pubDate), as a string, { text }, or { __cdata }. */
+function firstText(...values: unknown[]): string | undefined {
+  for (const value of values) {
+    for (const entry of asArray(value)) {
+      const record = typeof entry === "object" && entry !== null ? (entry as Record<string, unknown>) : undefined;
+      const text = typeof entry === "string" ? entry : record ? `${typeof record.text === "string" ? record.text : ""}${asArray(record.__cdata).join("")}` : "";
+      if (text.trim()) return text.trim();
+    }
+  }
+  return undefined;
 }
 
 const collapse = (value: string) => value.replace(/\s+/g, " ").trim();
 
-/** RSS plain text: already decoded by the parser, except inside CDATA, where publishers write HTML entities. */
+/** RSS plain text: text segments are already decoded; publishers write HTML entities inside CDATA. */
 function rssPlain(node: TextNode | undefined) {
   if (!node) return "";
-  return collapse(node.cdata ? decodeEntities(node.text) : node.text);
+  return collapse(node.segments.map((segment) => (segment.cdata ? decodeEntities(segment.text) : segment.text)).join(""));
 }
 
-/** Atom text constructs: type="html" and "xhtml" are markup; "text" (the default) is literal. */
+/** Atom text constructs: type="html" and "xhtml" are markup; "text" (the default) is literal, CDATA included. */
 function atomText(node: TextNode | undefined) {
   if (!node) return "";
-  return node.type === "html" || node.type === "xhtml" ? cleanText(node.text) : collapse(node.text);
+  return node.type === "html" || node.type === "xhtml" ? cleanText(htmlSource(node)) : collapse(htmlSource(node));
 }
 
 function atomLink(value: unknown): string | undefined {
@@ -113,7 +141,7 @@ function rssLink(item: Record<string, unknown>, baseUrl: string): string | undef
 
 /** RSS descriptions are HTML: strip tags, decode entities, and cut to card length. */
 function rssSummary(...values: unknown[]) {
-  return truncateText(cleanText(firstText(...values)), SUMMARY_MAX_LENGTH);
+  return truncateText(cleanText(htmlSource(firstNode(...values))), SUMMARY_MAX_LENGTH);
 }
 
 function atomSummary(...values: unknown[]) {
@@ -145,7 +173,7 @@ function imageUrlFrom(value: unknown): string | undefined {
 
 function imageFromHtml(...values: unknown[]): string | undefined {
   for (const value of values) {
-    const html = textNode(value)?.text;
+    const html = htmlSource(textNode(value));
     if (!html) continue;
     for (const tag of html.match(/<img\b[^>]*>/gi) ?? []) {
       const match = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag);
@@ -300,9 +328,9 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
         title: rssPlain(textNode(item.title)) || "Untitled",
         url: rssLink(item, base),
         summary: rssSummary(item.description, item["content:encoded"]),
-        content: firstText(item["content:encoded"], item.description),
+        content: htmlSource(firstNode(item["content:encoded"], item.description)) || undefined,
         date: firstText(item.pubDate, item["dc:date"], item.isoDate),
-        author: authorName(item["dc:creator"] ?? item.author, false),
+        author: authorName(item["dc:creator"], false) ?? firstText(item.author),
         source: feedUrl,
         image: firstImage(item),
       })),
@@ -317,7 +345,7 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
           title: atomText(textNode(entry.title)) || "Untitled",
           url: link ? resolveUrl(link, base) : undefined,
           summary: atomSummary(entry.summary, entry.content),
-          content: firstText(entry.content, entry.summary),
+          content: htmlSource(firstNode(entry.content, entry.summary)) || undefined,
           // published is when the post went out; updated moves on every small edit.
           date: firstText(entry.published, entry.updated),
           author: authorName(entry.author, true),
