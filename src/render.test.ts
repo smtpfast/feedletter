@@ -18,6 +18,19 @@ const issue: DigestIssue = {
   ],
 };
 
+function withTimeZones(check: (tz: string) => void) {
+  const previous = process.env.TZ;
+  try {
+    for (const tz of ["America/Los_Angeles", "UTC", "Asia/Tokyo"]) {
+      process.env.TZ = tz;
+      check(tz);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+}
+
 describe("renderers", () => {
   it("renders email html", () => {
     const html = renderHtml(issue);
@@ -54,5 +67,32 @@ describe("renderers", () => {
     const html = renderHtml(xss);
     expect(html).not.toContain("<script>alert(1)</script>");
     expect(html).toContain("&lt;script&gt;");
+  });
+
+  it("shows a date-only value as the same day in every time zone", () => {
+    withTimeZones((tz) => {
+      const html = renderHtml({ ...issue, items: [{ title: "Dated", date: "2026-05-30" }] });
+      expect(html, tz).toContain("May 30, 2026");
+    });
+  });
+
+  it("formats a real midnight timestamp as an instant, like any other time", () => {
+    withTimeZones((tz) => {
+      const utcMidnight = renderHtml({ ...issue, items: [{ title: "A", date: "2026-05-30T00:00:00Z" }] });
+      const sameInstant = renderHtml({ ...issue, items: [{ title: "A", date: "2026-05-29T17:00:00-07:00" }] });
+      expect(utcMidnight, tz).toBe(sameInstant);
+    });
+  });
+
+  it("pads the preheader and only renders it when set", () => {
+    expect(renderHtml(issue)).toContain("Two posts from the blog.&#847;&zwnj;&nbsp;");
+    expect(renderHtml({ ...issue, preheader: "" })).not.toContain("mso-hide:all");
+  });
+
+  it("includes Outlook fallbacks and a mobile breakpoint", () => {
+    const html = renderHtml(issue);
+    expect(html).toContain('<!--[if mso]><table role="presentation" width="680"');
+    expect(html).toContain('bgcolor="#059669"');
+    expect(html).toContain("@media only screen and (max-width:480px)");
   });
 });

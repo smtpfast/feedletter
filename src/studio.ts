@@ -26,6 +26,7 @@ import {
 } from "./smtpfast.js";
 import { renderStudioPage } from "./studio-ui.js";
 import type { DigestIssue, SourceItem } from "./types.js";
+import { hostLabel } from "./utils.js";
 import { enrichIssueWithCommand } from "./writer.js";
 
 export interface StudioOptions {
@@ -208,12 +209,7 @@ async function handleLoad(req: IncomingMessage, res: ServerResponse, ctx: Server
     const url = toStringField(body.rss).trim();
     if (!url) return sendJson(res, 400, { error: "Enter an RSS or Atom feed URL." });
     const items = await loadRssFeed({ url, limit });
-    let sourceLabel = "Feed";
-    try {
-      sourceLabel = new URL(url).hostname.replace(/^www\./, "");
-    } catch {
-      /* keep default */
-    }
+    const sourceLabel = hostLabel(items[0]?.source ?? url, "Feed");
     return sendJson(res, 200, { items: withSeen(items, ctx), sourceLabel });
   }
 
