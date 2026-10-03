@@ -21,7 +21,8 @@ agent command such as Claude Code, Codex, or your own script.
 ## Features
 
 - browser studio: click-ops curation, inline editing, live preview, one-click send
-- RSS/Atom and Markdown/MDX ingestion
+- RSS 2.0, RSS 1.0 (RDF), and Atom feeds, plus Markdown/MDX folders
+- feed autodiscovery: paste a blog's home page and Feedletter follows the feed it links to
 - polished email-safe HTML and plain-text output
 - per-recipient unsubscribe links via SMTPfast (`{{unsubscribe_url}}`)
 - SQLite history tracking so the same post is not included twice
@@ -53,6 +54,12 @@ feedletter build \
   --title "This week's product updates" \
   --out dist/newsletter
 ```
+
+`--rss` also accepts a site's home page (or a URL without `https://`) when the
+page advertises its feed with `<link rel="alternate">`. Feed text is cleaned for
+email: HTML entities are decoded, the feed's declared character encoding is
+respected, and full-text posts are shortened to a summary of about 300
+characters.
 
 Build from a Markdown content directory:
 
