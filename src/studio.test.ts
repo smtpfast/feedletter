@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
-import { isLoopbackHost, rejectForeignRequest, startStudioServer } from "./studio.js";
+import { bindNeedsHostGuard, isLoopbackHost, rejectForeignRequest, startStudioServer } from "./studio.js";
 import { SEND_GUARD_SOURCE } from "./studio-ui.js";
 
 let studio: Server;
@@ -293,19 +293,26 @@ describe("studio request guard", () => {
     }
   });
 
-  it("enforces the Host check for every loopback bind", () => {
-    for (const bind of ["LOCALHOST", "127.0.0.2", "::1", "0:0:0:0:0:0:0:1"]) {
-      expect(rejectForeignRequest(fake({ host: "attacker.example:4180" }), bind), bind).toBe("Unknown host.");
+  it("applies the Host check to every bind that resolves to loopback, and fails closed", async () => {
+    for (const bind of ["LOCALHOST", "127.0.0.2", "127.1", "::1", "0:0:0:0:0:0:0:1", "no-such-host.invalid"]) {
+      expect(await bindNeedsHostGuard(bind), bind).toBe(true);
     }
-    expect(rejectForeignRequest(fake({ host: "127.0.0.2:4180" }), "127.0.0.2")).toBeUndefined();
-    expect(rejectForeignRequest(fake({ host: "LOCALHOST:4180" }), "127.0.0.1")).toBeUndefined();
-    expect(rejectForeignRequest(fake({ host: "[::1]:4180" }), "::1")).toBeUndefined();
+    for (const bind of ["0.0.0.0", "::", "192.168.1.5"]) {
+      expect(await bindNeedsHostGuard(bind), bind).toBe(false);
+    }
+  });
+
+  it("rejects a foreign Host when the guard applies", () => {
+    expect(rejectForeignRequest(fake({ host: "attacker.example:4180" }), true)).toBe("Unknown host.");
+    expect(rejectForeignRequest(fake({ host: "127.0.0.2:4180" }), true)).toBeUndefined();
+    expect(rejectForeignRequest(fake({ host: "LOCALHOST:4180" }), true)).toBeUndefined();
+    expect(rejectForeignRequest(fake({ host: "[::1]:4180" }), true)).toBeUndefined();
   });
 
   it("accepts any Host on an explicit non-loopback bind but still checks Origin", () => {
-    expect(rejectForeignRequest(fake({ host: "192.168.1.5:4180" }), "0.0.0.0")).toBeUndefined();
+    expect(rejectForeignRequest(fake({ host: "192.168.1.5:4180" }), false)).toBeUndefined();
     const crossSite = fake({ host: "192.168.1.5:4180", origin: "https://evil.example", "content-type": "application/json" }, "POST");
-    expect(rejectForeignRequest(crossSite, "0.0.0.0")).toMatch(/Cross-origin/);
+    expect(rejectForeignRequest(crossSite, false)).toMatch(/Cross-origin/);
   });
 });
 
