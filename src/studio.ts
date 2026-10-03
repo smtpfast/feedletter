@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { isIP } from "node:net";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
@@ -30,11 +31,35 @@ interface ServerContext extends StudioOptions {
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+/** Lowercase a host and strip IPv6 brackets: "[::1]" and "::1" compare equal. */
+function normalizeHost(host: string) {
+  return host.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1");
+}
 
+/** The hostname part of a Host header, without the port. */
 function hostnameOf(hostHeader: string | undefined) {
   if (!hostHeader) return "";
-  return hostHeader.startsWith("[") ? hostHeader.slice(0, hostHeader.indexOf("]") + 1) : hostHeader.replace(/:\d+$/, "");
+  const value = hostHeader.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(value);
+  return normalizeHost(bracketed ? bracketed[1] : value.replace(/:\d+$/, ""));
+}
+
+function isIpv6Loopback(address: string) {
+  if (/^::ffff:127\./.test(address)) return true;
+  const [head, tail] = address.includes("::") ? address.split("::") : [address, undefined];
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(8 - left.length - right.length, 0)).fill("0"), ...right];
+  return groups.length === 8 && groups.slice(0, 7).every((group) => /^0+$/.test(group)) && /^0*1$/.test(groups[7]);
+}
+
+/** localhost (any case), any 127.0.0.0/8 address, or ::1 in any spelling. */
+export function isLoopbackHost(host: string) {
+  const h = normalizeHost(host);
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (isIP(h) === 4) return h.startsWith("127.");
+  if (isIP(h) === 6) return isIpv6Loopback(h);
+  return false;
 }
 
 /**
@@ -43,10 +68,11 @@ function hostnameOf(hostHeader: string | undefined) {
  * Returns an error message for a request a web page elsewhere could make.
  */
 export function rejectForeignRequest(req: IncomingMessage, bindHost: string): string | undefined {
-  const host = hostnameOf(req.headers.host).toLowerCase();
-  // On a loopback bind, a different Host header means DNS rebinding. Binding to
-  // another interface is an explicit opt-in, so any Host is accepted there.
-  if (LOOPBACK_HOSTS.has(bindHost) && !LOOPBACK_HOSTS.has(host)) return "Unknown host.";
+  const host = hostnameOf(req.headers.host);
+  // On a loopback bind, a Host that is not a loopback name means DNS rebinding.
+  // Binding to another interface is an explicit opt-in, so any Host is accepted
+  // there; the Origin and content-type checks below still apply.
+  if (isLoopbackHost(bindHost) && !isLoopbackHost(host)) return "Unknown host.";
   if (req.method !== "POST") return undefined;
   const origin = req.headers.origin;
   if (origin) {
@@ -56,7 +82,7 @@ export function rejectForeignRequest(req: IncomingMessage, bindHost: string): st
     } catch {
       return "Cross-origin requests are not allowed.";
     }
-    if (originHost !== (req.headers.host ?? "").toLowerCase()) return "Cross-origin requests are not allowed.";
+    if (originHost !== (req.headers.host ?? "").trim().toLowerCase()) return "Cross-origin requests are not allowed.";
   }
   // A JSON content type forces a CORS preflight for any cross-site caller.
   if (!/^application\/json\b/i.test(req.headers["content-type"] ?? "")) return "Send JSON with Content-Type: application/json.";
