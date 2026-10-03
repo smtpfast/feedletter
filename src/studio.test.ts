@@ -17,7 +17,7 @@ let contentDir: string;
 // A stand-in for the SMTPfast API so the studio's own fetch has something to hit
 // without stubbing global fetch (which the test itself uses to call the studio).
 const received: Array<{ method?: string; url?: string; body: unknown }> = [];
-const broadcasts = new Map<string, { status: string; subject: string }>();
+const broadcasts = new Map<string, { status: string; subject: string; from: string; segmentId?: string }>();
 let broadcastSeq = 0;
 
 function startMock(): Promise<Server> {
@@ -54,13 +54,26 @@ function startMock(): Promise<Server> {
       }
       if (req.method === "POST" && req.url === "/v1/broadcasts") {
         const id = `bc_${++broadcastSeq}`;
-        broadcasts.set(id, { status: "draft", subject: (body as { subject: string }).subject });
+        const input = body as { subject: string; from: string; segment_id?: string };
+        broadcasts.set(id, { status: "draft", subject: input.subject, from: input.from, segmentId: input.segment_id });
         return json(201, { object: "broadcast", id, status: "draft" });
       }
       const broadcastPath = /^\/v1\/broadcasts\/(bc_\d+)(\/send)?$/.exec(req.url ?? "");
       if (broadcastPath && broadcasts.has(broadcastPath[1])) {
         const record = broadcasts.get(broadcastPath[1])!;
-        if (req.method === "GET") return json(200, { object: "broadcast", id: broadcastPath[1], status: record.status, recipient_count: 4, recipients: [] });
+        if (req.method === "GET") {
+          return json(200, {
+            object: "broadcast",
+            id: broadcastPath[1],
+            status: record.status,
+            audience: record.segmentId ? "segment" : "all_contacts",
+            audience_meta: record.segmentId ? { segment_id: record.segmentId } : {},
+            from: record.from,
+            subject: record.subject,
+            recipient_count: 4,
+            recipients: [],
+          });
+        }
         if (req.method === "POST" && broadcastPath[2]) {
           record.status = "queued";
           // "Lost" queues the broadcast, then drops the connection before answering.
@@ -289,7 +302,14 @@ describe("studio server", () => {
     const second = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
     const other = await HistoryStore.open(historyDb);
     let release!: () => void;
-    const holding = other.exclusive(() => new Promise<void>((resolve) => (release = resolve)));
+    let holding!: Promise<void>;
+    // Send only once the other process really holds the lock.
+    await new Promise<void>((held) => {
+      holding = other.exclusive(() => new Promise<void>((resolve) => {
+        release = resolve;
+        held();
+      }));
+    });
     try {
       const res = await fetch(`http://127.0.0.1:${(second.address() as AddressInfo).port}/api/send`, {
         method: "POST",
@@ -303,6 +323,68 @@ describe("studio server", () => {
       await holding;
       other.close();
       await new Promise<void>((r) => second.close(() => r()));
+    }
+  });
+
+  it("does not send a saved draft whose audience was changed in the dashboard", async () => {
+    received.length = 0;
+    const body = { apiKey: "k", from: "news@example.com", segmentId: "seg_1", draft: { ...draft, title: "Retargeted" }, baseUrl: mockUrl };
+    const saved = await post("/api/broadcast", body);
+    const record = broadcasts.get(String(saved.data.id))!;
+    record.segmentId = undefined; // someone switched it to all contacts in SMTPfast
+
+    const send = await post("/api/broadcast", { ...body, send: true });
+    expect(send.status).toBe(409);
+    expect(String(send.data.error)).toMatch(/was changed in SMTPfast: audience is all_contacts, this run wants segment seg_1/);
+    expect(received.some((r) => r.url?.endsWith("/send"))).toBe(false);
+  });
+
+  it("trusts the history file over memory when history is on", async () => {
+    const historyDb = path.join(contentDir, "authoritative.sqlite");
+    const studioWithHistory = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
+    const url = `http://127.0.0.1:${(studioWithHistory.address() as AddressInfo).port}/api/broadcast`;
+    const call = (extra: Record<string, unknown>) =>
+      fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "k", from: "news@example.com", draft: { ...draft, title: "Shared" }, baseUrl: mockUrl, ...extra }),
+      });
+    try {
+      expect((await call({})).status).toBe(200);
+      // Another process sent this email as its own broadcast and recorded it.
+      broadcasts.set("bc_900", { status: "sent", subject: "Shared", from: "news@example.com" });
+      const other = await HistoryStore.open(historyDb);
+      await other.exclusive(async () => {
+        const db = (other as unknown as { db: { run(sql: string): void } }).db;
+        db.run("UPDATE broadcasts SET broadcast_id = 'bc_900'");
+        await (other as unknown as { persist(): Promise<void> }).persist();
+      });
+      other.close();
+
+      received.length = 0;
+      const send = await call({ send: true });
+      expect(send.status).toBe(409);
+      expect(String(((await send.json()) as { error: string }).error)).toMatch(/already went out as broadcast bc_900/);
+      expect(received.some((r) => r.url?.endsWith("/send"))).toBe(false);
+    } finally {
+      await new Promise<void>((r) => studioWithHistory.close(() => r()));
+    }
+  });
+
+  it("answers 409 when a previous send left its lock behind", async () => {
+    const historyDb = path.join(contentDir, "stale.sqlite");
+    const studioWithHistory = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
+    await writeFile(`${historyDb}.lock`, "2147483646\n");
+    try {
+      const res = await fetch(`http://127.0.0.1:${(studioWithHistory.address() as AddressInfo).port}/api/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "k", from: "news@example.com", recipients: "s@x.com", draft: { ...draft, title: "Stale" }, baseUrl: mockUrl }),
+      });
+      expect(res.status).toBe(409);
+      expect(String(((await res.json()) as { error: string }).error)).toMatch(/A previous send did not finish.*If no other Feedletter is running/);
+    } finally {
+      await new Promise<void>((r) => studioWithHistory.close(() => r()));
     }
   });
 

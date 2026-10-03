@@ -4,7 +4,7 @@ import { isIP } from "node:net";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
-import { HistoryStore, itemHistoryKey } from "./history.js";
+import { HistoryLockError, HistoryStore, itemHistoryKey } from "./history.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
 import {
@@ -335,10 +335,20 @@ const BUSY_MESSAGE = "Another send is still running. Wait for it to finish, then
 /** Progress of one exact send: in the history DB, or in memory with --no-history. */
 function checkpointFor(ctx: ServerContext, key: string): SendCheckpoint {
   const store = ctx.historyStore;
-  if (store) return { previous: store.sentRecipients(key), record: (rows, state) => store.recordRecipients(key, rows, state) };
+  if (store) {
+    return {
+      previous: store.sentRecipients(key),
+      record: (rows, state) => store.recordRecipients(key, rows, state),
+      forget: (recipients) => store.forgetRecipients(key, recipients),
+    };
+  }
   const sent = ctx.memorySent.get(key) ?? new Map<string, "sent" | "uncertain">();
   ctx.memorySent.set(key, sent);
-  return { previous: new Map(sent), record: (rows, state) => rows.forEach((row) => sent.set(row.recipient.toLowerCase(), state)) };
+  return {
+    previous: new Map(sent),
+    record: (rows, state) => rows.forEach((row) => sent.set(row.recipient.toLowerCase(), state)),
+    forget: (recipients) => recipients.forEach((recipient) => sent.delete(recipient.toLowerCase())),
+  };
 }
 
 /**
@@ -355,8 +365,7 @@ async function exclusiveSend<T>(ctx: ServerContext, fn: () => Promise<T>): Promi
 }
 
 function lockMessage(error: unknown) {
-  const message = error instanceof Error ? error.message : String(error);
-  return /^Another feedletter send is using|^Could not lock/.test(message) ? message : undefined;
+  return error instanceof HistoryLockError ? error.message : undefined;
 }
 
 async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
@@ -439,9 +448,11 @@ async function handleBroadcast(req: IncomingMessage, res: ServerResponse, ctx: S
     return await exclusiveSend(ctx, async () => {
       // Only a draft created earlier for this exact email is reused. Anything
       // that may have reached contacts stops instead of creating a second campaign.
-      const savedId = ctx.memoryBroadcasts.get(key) ?? ctx.historyStore?.broadcastFor(key);
+      // With history on, the file just re-read under the lock is the truth (another
+      // process may have changed it); memory is only for --no-history.
+      const savedId = ctx.historyStore ? ctx.historyStore.broadcastFor(key) : ctx.memoryBroadcasts.get(key);
       if (savedId) {
-        const decision = await checkSavedBroadcast(config, savedId);
+        const decision = await checkSavedBroadcast(config, savedId, { from, subject: email.subject, segmentId });
         if (decision.action === "stop") {
           return sendJson(res, 409, { error: `${decision.message} Change the email to send a new broadcast.`, url: decision.url, broadcastId: savedId });
         }
@@ -459,8 +470,8 @@ async function handleBroadcast(req: IncomingMessage, res: ServerResponse, ctx: S
           segmentId,
         });
         broadcastId = draft.id;
-        ctx.memoryBroadcasts.set(key, draft.id);
-        await ctx.historyStore?.recordBroadcast(key, draft.id);
+        if (ctx.historyStore) await ctx.historyStore.recordBroadcast(key, draft.id);
+        else ctx.memoryBroadcasts.set(key, draft.id);
       }
       if (!sendNow) return sendJson(res, 200, { id: broadcastId, status: "draft", url: broadcastUrl(broadcastId), reused });
 

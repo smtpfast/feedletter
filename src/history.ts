@@ -1,4 +1,4 @@
-import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
@@ -30,7 +30,17 @@ function processAlive(pid: number) {
   }
 }
 
+/** The history file is locked by another send, or by one that did not finish. */
+export class HistoryLockError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "HistoryLockError";
+  }
+}
+
 export class HistoryStore {
+  private locked = false;
+
   private constructor(
     private readonly dbPath: string,
     private readonly SQL: SqlJsStatic,
@@ -50,44 +60,44 @@ export class HistoryStore {
       db = new SQL.Database();
     }
 
+    // Opening never writes: the tables are created in memory, and the file is
+    // only written under the lock (see exclusive), so an old snapshot can never
+    // be renamed over another process's newer progress.
     const store = new HistoryStore(dbPath, SQL, db);
     store.migrate();
-    await store.persist();
     return store;
   }
 
   /**
    * Run fn while holding an exclusive lock file next to the history file, after
    * re-reading the file, so two processes cannot send at once or overwrite
-   * each other's progress. The lock holds the pid; a lock whose process is gone
-   * is stale and is taken over.
+   * each other's progress. Every write happens in here. The lock holds the pid.
+   * A lock is never taken over: if its process is gone, a previous send did not
+   * finish, and a person has to look before anything is sent again.
    */
   async exclusive<T>(fn: () => Promise<T>): Promise<T> {
     const lockPath = `${this.dbPath}.lock`;
-    let acquired = false;
-    for (let attempt = 0; attempt < 2 && !acquired; attempt++) {
-      try {
-        const handle = await open(lockPath, "wx");
-        await handle.writeFile(`${process.pid}\n`);
-        await handle.close();
-        acquired = true;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-        const pid = Number.parseInt((await readFile(lockPath, "utf8").catch(() => "")).trim(), 10);
-        const young = await stat(lockPath).then((info) => Date.now() - info.mtimeMs < 5000, () => false);
-        if (Number.isInteger(pid) && pid > 0 ? processAlive(pid) : young) {
-          throw new Error(
-            `Another feedletter send is using ${this.dbPath}${Number.isInteger(pid) ? ` (process ${pid})` : ""}. Wait for it to finish. If no send is running, delete ${lockPath}.`,
-          );
-        }
-        await rm(lockPath, { force: true });
+    try {
+      const handle = await open(lockPath, "wx");
+      await handle.writeFile(`${process.pid}\n`);
+      await handle.close();
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      const pid = Number.parseInt((await readFile(lockPath, "utf8").catch(() => "")).trim(), 10);
+      const holder = Number.isInteger(pid) && pid > 0 ? ` (process ${pid})` : "";
+      if (holder && processAlive(pid)) {
+        throw new HistoryLockError(`Another feedletter send is using ${this.dbPath}${holder}. Wait for it to finish.`);
       }
+      throw new HistoryLockError(
+        `A previous send did not finish: ${lockPath} is still there${holder}. If no other Feedletter is running, check the SMTPfast logs, then remove ${lockPath}.`,
+      );
     }
-    if (!acquired) throw new Error(`Could not lock ${this.dbPath}. If no send is running, delete ${lockPath}.`);
+    this.locked = true;
     try {
       await this.reload();
       return await fn();
     } finally {
+      this.locked = false;
       await rm(lockPath, { force: true });
     }
   }
@@ -181,6 +191,17 @@ export class HistoryStore {
     await this.persist();
   }
 
+  /** Remove addresses recorded ahead of a batch that SMTPfast then refused (a 4xx: nothing was queued). */
+  async forgetRecipients(sendKey: string, recipients: string[]) {
+    const stmt = this.db.prepare("DELETE FROM sent_recipients WHERE send_key = ? AND recipient = ?");
+    try {
+      for (const recipient of recipients) stmt.run([sendKey, recipient.toLowerCase()]);
+    } finally {
+      stmt.free();
+    }
+    await this.persist();
+  }
+
   /** The broadcast created for this exact send, if any. */
   broadcastFor(sendKey: string): string | undefined {
     const stmt = this.db.prepare("SELECT broadcast_id FROM broadcasts WHERE send_key = ?");
@@ -246,6 +267,7 @@ export class HistoryStore {
   }
 
   private async persist() {
+    if (!this.locked) throw new Error("Feedletter bug: the history file was written outside its lock.");
     // Write a temp file and rename it, so a crash never leaves half a database.
     const temp = `${this.dbPath}.${process.pid}.tmp`;
     await writeFile(temp, Buffer.from(this.db.export()));

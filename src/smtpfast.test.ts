@@ -107,20 +107,27 @@ describe("sendDigest", () => {
   }
   const checkpointFor = (store: HistoryStore, resend = false): SendCheckpoint => {
     const key = sendKey(message);
-    return { previous: resend ? new Map() : store.sentRecipients(key), record: (rows, state) => store.recordRecipients(key, rows, state) };
+    return {
+      previous: resend ? new Map() : store.sentRecipients(key),
+      record: (rows, state) => store.recordRecipients(key, rows, state),
+      forget: (recipients) => store.forgetRecipients(key, recipients),
+    };
   };
+  // Every history write happens under the lock, as in the CLI and the studio.
+  const send = (store: HistoryStore, list: string[], resend = false) =>
+    store.exclusive(() => sendDigest(config, message, list, { checkpoint: checkpointFor(store, resend) }));
   const recipients150 = Array.from({ length: 150 }, (_, i) => `user${i}@example.com`);
 
   it("resends only the refused batch on a rerun after a 4xx", async () => {
     await withStore(async (store) => {
       // SMTPfast refuses with a 4xx before it queues anything.
       mockApi((call, index) => (index === 0 ? okBatch(call) : { status: 403, body: { error: "Item 0: domain example.com is not verified" } }));
-      const first = await sendDigest(config, message, recipients150, { checkpoint: checkpointFor(store) });
+      const first = await send(store, recipients150);
       expect(first.filter((r) => r.ok)).toHaveLength(100);
       expect(first.filter((r) => r.uncertain)).toHaveLength(0);
 
       mockApi(okBatch);
-      const second = await sendDigest(config, message, recipients150, { checkpoint: checkpointFor(store) });
+      const second = await send(store, recipients150);
       expect(calls).toHaveLength(1);
       expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients150.slice(100));
       expect(second.filter((r) => r.alreadySent)).toHaveLength(100);
@@ -133,7 +140,7 @@ describe("sendDigest", () => {
     await withStore(async (store) => {
       const recipients = Array.from({ length: 250 }, (_, i) => `user${i}@example.com`);
       mockApi((call, index) => (index === 0 ? okBatch(call) : { status: 500, body: { error: "Internal error" } }));
-      const first = await sendDigest(config, message, recipients, { checkpoint: checkpointFor(store) });
+      const first = await send(store, recipients);
       expect(calls).toHaveLength(2);
       expect(first.filter((r) => r.ok)).toHaveLength(100);
       expect(first.filter((r) => r.uncertain)).toHaveLength(100);
@@ -141,15 +148,52 @@ describe("sendDigest", () => {
 
       // The rerun sends only the 50 that never went out; the uncertain 100 are skipped.
       mockApi(okBatch);
-      const second = await sendDigest(config, message, recipients, { checkpoint: checkpointFor(store) });
+      const second = await send(store, recipients);
       expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients.slice(200));
       expect(second.filter((r) => r.uncertain)).toHaveLength(100);
 
       // --resend sends to everyone.
       mockApi(okBatch);
-      await sendDigest(config, message, recipients, { checkpoint: checkpointFor(store, true) });
+      await send(store, recipients, true);
       expect(calls.reduce((sum, call) => sum + (call.body as unknown[]).length, 0)).toBe(250);
     });
+  });
+
+  it("writes each batch ahead as uncertain before it goes out, then marks it sent or forgets it", async () => {
+    const states = new Map<string, "sent" | "uncertain">();
+    const checkpoint: SendCheckpoint = {
+      previous: new Map(),
+      record: (rows, state) => rows.forEach((row) => states.set(row.recipient, state)),
+      forget: (list) => list.forEach((recipient) => states.delete(recipient)),
+    };
+    let atPost = new Map<string, string>();
+    mockApi((call) => {
+      atPost = new Map(states);
+      return okBatch(call);
+    });
+    await sendDigest(config, message, ["a@example.com", "b@example.com"], { checkpoint });
+    expect([...atPost]).toEqual([["a@example.com", "uncertain"], ["b@example.com", "uncertain"]]);
+    expect([...states.values()]).toEqual(["sent", "sent"]);
+
+    // A refused batch (4xx) queued nothing, so its write-ahead entries are removed.
+    states.clear();
+    mockApi(() => ({ status: 403, body: { error: "domain not verified" } }));
+    await sendDigest(config, message, ["c@example.com"], { checkpoint });
+    expect(states.size).toBe(0);
+
+    // A crash between SMTPfast's answer and the "sent" write leaves the batch uncertain, never unrecorded.
+    states.clear();
+    mockApi(okBatch);
+    const crashing: SendCheckpoint = {
+      ...checkpoint,
+      record: (rows, state) => {
+        if (state === "sent") throw new Error("disk full");
+        checkpoint.record(rows, state);
+      },
+    };
+    const [result] = await sendDigest(config, message, ["d@example.com"], { checkpoint: crashing });
+    expect(result.ok).toBe(true);
+    expect(states.get("d@example.com")).toBe("uncertain");
   });
 
   it("skips invalid addresses and reports suppressed rows", async () => {
@@ -307,21 +351,43 @@ describe("broadcasts", () => {
   });
 
   it("decides what to do with a saved broadcast from its status", async () => {
-    const status = (value: string, code = 200) => mockApi(() => (code === 200 ? { body: { id: "bc_1", status: value } } : { status: code, body: { error: "Broadcast not found" } }));
+    const expected = { from: "news@example.com", subject: "Hi" };
+    const status = (value: string, code = 200) =>
+      mockApi(() =>
+        code === 200
+          ? { body: { id: "bc_1", status: value, audience: "all_contacts", audience_meta: {}, from: "news@example.com", subject: "Hi" } }
+          : { status: code, body: { error: "Broadcast not found" } },
+      );
     status("draft");
-    expect(await checkSavedBroadcast(config, "bc_1")).toEqual({ action: "reuse", id: "bc_1" });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toEqual({ action: "reuse", id: "bc_1" });
     status("", 404);
-    expect(await checkSavedBroadcast(config, "bc_1")).toEqual({ action: "create" });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toEqual({ action: "create" });
     for (const sent of ["scheduled", "queued", "sending", "sent", "paused"]) {
       status(sent);
-      expect(await checkSavedBroadcast(config, "bc_1")).toMatchObject({ action: "stop", message: expect.stringMatching(/already went out/) });
+      expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/already went out/) });
     }
     for (const partial of ["failed", "canceled"]) {
       status(partial);
-      expect(await checkSavedBroadcast(config, "bc_1")).toMatchObject({ action: "stop", message: expect.stringMatching(/some contacts may already have it/) });
+      expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/some contacts may already have it/) });
     }
     status("archived");
-    expect(await checkSavedBroadcast(config, "bc_1")).toMatchObject({ action: "stop", message: expect.stringMatching(/cannot tell/) });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/cannot tell/) });
+  });
+
+  it("never reuses a draft whose audience, sender, or subject was changed in the dashboard", async () => {
+    const draft = (fields: Record<string, unknown>) =>
+      mockApi(() => ({ body: { id: "bc_1", status: "draft", audience: "segment", audience_meta: { segment_id: "seg_a" }, from: "news@example.com", subject: "Hi", ...fields } }));
+    const expected = { from: "news@example.com", subject: "Hi", segmentId: "seg_a" };
+    draft({});
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toEqual({ action: "reuse", id: "bc_1" });
+    draft({ audience: "all_contacts", audience_meta: {} });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/audience is all_contacts, this run wants segment seg_a/) });
+    draft({ audience_meta: { segment_id: "seg_b" } });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/segment seg_b/) });
+    draft({ from: "other@example.com" });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/sender is other@example.com/) });
+    draft({ subject: "Edited" });
+    expect(await checkSavedBroadcast(config, "bc_1", expected)).toMatchObject({ action: "stop", message: expect.stringMatching(/subject is different/) });
   });
 
   it("creates a draft for a segment and links to it", async () => {

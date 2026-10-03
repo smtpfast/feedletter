@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { HistoryStore, itemHistoryKey } from "./history.js";
@@ -37,7 +38,7 @@ describe("HistoryStore", () => {
     const store = await HistoryStore.open(dbPath);
     expect(store.seenKeys(items).size).toBe(0);
 
-    await store.recordIssue(issueOf(items));
+    await store.exclusive(() => store.recordIssue(issueOf(items)));
     expect(store.seenKeys(items).size).toBe(2);
     store.close();
 
@@ -49,6 +50,21 @@ describe("HistoryStore", () => {
     const fresh: SourceItem = { title: "Three", url: "https://example.com/3" };
     expect(reopened.seenKeys([fresh]).size).toBe(0);
     reopened.close();
+  });
+
+  it("does not write the file when it is opened", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath);
+    expect(existsSync(dbPath)).toBe(false);
+    await store.exclusive(() => store.recordIssue(issueOf(items)));
+    expect(existsSync(dbPath)).toBe(true);
+    store.close();
+  });
+
+  it("refuses to write outside the lock", async () => {
+    const store = await HistoryStore.open(path.join(dir, "history.sqlite"));
+    await expect(store.recordIssue(issueOf(items))).rejects.toThrow(/outside its lock/);
+    store.close();
   });
 
   it("keys items by url so titles can change", () => {
@@ -64,8 +80,14 @@ describe("HistoryStore send lock", () => {
     const a = await HistoryStore.open(dbPath);
     const b = await HistoryStore.open(dbPath);
     let release!: () => void;
-    const holding = a.exclusive(() => new Promise<void>((resolve) => (release = resolve)));
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    let holding!: Promise<void>;
+    // Wait until a really holds the lock before b tries.
+    await new Promise<void>((held) => {
+      holding = a.exclusive(() => new Promise<void>((resolve) => {
+        release = resolve;
+        held();
+      }));
+    });
     await expect(b.exclusive(async () => "sent")).rejects.toThrow(/Another feedletter send is using .*process \d+/);
     release();
     await holding;
@@ -74,12 +96,16 @@ describe("HistoryStore send lock", () => {
     b.close();
   });
 
-  it("takes over a lock whose process is gone, and removes it afterwards", async () => {
+  it("stops, and leaves the lock in place, when the process that held it is gone", async () => {
     const dbPath = path.join(dir, "history.sqlite");
     const store = await HistoryStore.open(dbPath);
     await writeFile(`${dbPath}.lock`, "2147483646\n");
-    await expect(store.exclusive(async () => "ok")).resolves.toBe("ok");
-    await expect(access(`${dbPath}.lock`)).rejects.toThrow();
+    let ran = false;
+    await expect(store.exclusive(async () => (ran = true))).rejects.toThrow(
+      /A previous send did not finish: .*history\.sqlite\.lock is still there \(process 2147483646\)\. If no other Feedletter is running/,
+    );
+    expect(ran).toBe(false);
+    expect(existsSync(`${dbPath}.lock`)).toBe(true);
     store.close();
   });
 

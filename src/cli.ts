@@ -10,6 +10,7 @@ import { startPreviewServer } from "./preview.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
 import {
+  BROADCAST_SENT_STATUSES,
   broadcastUrl,
   checkRecipients,
   checkSavedBroadcast,
@@ -299,6 +300,7 @@ program
           const checkpoint: SendCheckpoint = {
             previous: options.resend ? new Map() : store.sentRecipients(key),
             record: (rows, state) => store.recordRecipients(key, rows, state),
+            forget: (recipients) => store.forgetRecipients(key, recipients),
           };
           const out = await sendDigest(config, message, checked.valid, { checkpoint });
           if (out.some((r) => r.ok || r.alreadySent)) await store.recordIssue(issue);
@@ -397,11 +399,12 @@ program
         let broadcastId: string | undefined;
         const savedId = options.resend ? undefined : store?.broadcastFor(key);
         if (savedId) {
-          const decision = await checkSavedBroadcast(config, savedId);
+          const decision = await checkSavedBroadcast(config, savedId, { from: options.from, subject: issue.title, segmentId });
           if (decision.action === "stop") {
             console.log(`${decision.message} ${decision.url}`);
             console.log("Nothing sent. Use --resend to create a new broadcast anyway.");
-            if (decision.status === "failed" || decision.status === "canceled") process.exitCode = 1;
+            // Already out is not an error; a changed draft, failed, canceled, or unknown one is.
+            if (!BROADCAST_SENT_STATUSES.has(decision.status)) process.exitCode = 1;
             return;
           }
           if (decision.action === "reuse") {

@@ -197,15 +197,17 @@ export function sendKey(message: Omit<SmtpfastMessage, "to">) {
 
 /**
  * Progress of one send, kept between runs. The batch endpoint has no
- * idempotency, so after a partial failure a rerun would send the accepted
- * batches again; the checkpoint lets it skip addresses SMTPfast already took,
- * and addresses whose batch ended in a 5xx or no answer.
+ * idempotency, so a rerun must skip addresses an earlier run may have reached.
+ * Each batch is written ahead as uncertain before it goes out, then marked
+ * sent, or forgotten when SMTPfast refuses it. A crash at any point leaves the
+ * batch uncertain, never unrecorded.
  */
 export interface SendCheckpoint {
   /** Lowercased addresses an earlier run of this exact send sent, or may have sent. */
   previous: Map<string, "sent" | "uncertain">;
-  /** Called after each batch that was accepted, or whose outcome is unknown, before the next one goes out. */
-  record(rows: SendResult[], state: "sent" | "uncertain"): Promise<void> | void;
+  record(rows: Array<{ recipient: string; id?: string }>, state: "sent" | "uncertain"): Promise<void> | void;
+  /** Drop addresses written ahead for a batch SMTPfast refused with a 4xx (nothing was queued). */
+  forget(recipients: string[]): Promise<void> | void;
 }
 
 /**
@@ -246,8 +248,16 @@ export async function sendDigest(
       results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: `not sent: ${stopError}` })));
       continue;
     }
-    let rows: SendResult[];
-    let state: "sent" | "uncertain" = "sent";
+    // Write ahead: the batch is uncertain on disk before it goes out.
+    try {
+      await checkpoint?.record(chunk.map((recipient) => ({ recipient })), "uncertain");
+    } catch (error) {
+      stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
+      results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: `not sent: ${stopError}` })));
+      continue;
+    }
+    let rows: SendResult[] | undefined;
+    let refused: string | undefined;
     try {
       const response = await smtpfastRequest<BatchResponse>(
         config,
@@ -264,28 +274,34 @@ export async function sendDigest(
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (refusedBeforeQueueing(error)) {
-        // Nothing was queued, and the same content would be refused again.
-        results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: message })));
-        stopError = "an earlier batch was refused";
+        refused = message;
+      } else {
+        // A 5xx or no answer can be a partial send: the batch stays uncertain on disk.
+        results.push(
+          ...chunk.map((recipient) => ({
+            recipient,
+            ok: false,
+            uncertain: true,
+            error: `${message} SMTPfast may have sent some of this batch; check the SMTPfast logs.`,
+          })),
+        );
+        stopError = "stopped after a batch with an unknown outcome";
         continue;
       }
-      state = "uncertain";
-      rows = chunk.map((recipient) => ({
-        recipient,
-        ok: false,
-        uncertain: true,
-        error: `${message} SMTPfast may have sent some of this batch; check the SMTPfast logs.`,
-      }));
-      stopError = "stopped after a batch with an unknown outcome";
     }
-    results.push(...rows);
-    if (checkpoint) {
-      try {
-        await checkpoint.record(rows, state);
-      } catch (error) {
-        // Without a saved checkpoint a rerun would resend this batch, so stop here.
-        stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
-      }
+    try {
+      if (rows) await checkpoint?.record(rows, "sent");
+      else await checkpoint?.forget(chunk);
+    } catch (error) {
+      // The batch stays recorded as uncertain, so a rerun skips it; stop here.
+      stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
+    }
+    if (rows) {
+      results.push(...rows);
+    } else {
+      // Nothing was queued, and the same content would be refused again.
+      results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: refused })));
+      stopError ??= "an earlier batch was refused";
     }
   }
   return results;
@@ -447,14 +463,34 @@ export async function createBroadcast(config: SmtpfastConfig, draft: BroadcastDr
 /** Statuses that mean the broadcast already went out, or is going out. */
 export const BROADCAST_SENT_STATUSES = new Set(["scheduled", "queued", "sending", "sent", "paused"]);
 
-/** Read a broadcast's current status. */
-export async function getBroadcast(config: SmtpfastConfig, id: string): Promise<BroadcastResult> {
-  const data = await smtpfastRequest<{ id?: string; status?: string; recipient_count?: number }>(
-    config,
-    "GET",
-    `/v1/broadcasts/${encodeURIComponent(id)}`,
-  );
-  return { id, status: data.status ?? "unknown", url: broadcastUrl(id), recipients: data.recipient_count };
+export interface BroadcastDetails extends BroadcastResult {
+  audience?: string;
+  segmentId?: string;
+  from?: string;
+  subject?: string;
+}
+
+/** Read a broadcast's current status, audience, sender, and subject. */
+export async function getBroadcast(config: SmtpfastConfig, id: string): Promise<BroadcastDetails> {
+  const data = await smtpfastRequest<{
+    id?: string;
+    status?: string;
+    recipient_count?: number;
+    audience?: string;
+    audience_meta?: { segment_id?: string };
+    from?: string | null;
+    subject?: string | null;
+  }>(config, "GET", `/v1/broadcasts/${encodeURIComponent(id)}`);
+  return {
+    id,
+    status: data.status ?? "unknown",
+    url: broadcastUrl(id),
+    recipients: data.recipient_count,
+    audience: data.audience,
+    segmentId: data.audience_meta?.segment_id,
+    from: data.from ?? undefined,
+    subject: data.subject ?? undefined,
+  };
 }
 
 export type SavedBroadcastDecision =
@@ -467,8 +503,12 @@ export type SavedBroadcastDecision =
  * Only a draft is reused. Anything that may have reached contacts stops the
  * run: a canceled or failed broadcast can have delivered to part of the list.
  */
-export async function checkSavedBroadcast(config: SmtpfastConfig, id: string): Promise<SavedBroadcastDecision> {
-  let current: BroadcastResult;
+export async function checkSavedBroadcast(
+  config: SmtpfastConfig,
+  id: string,
+  expected: { from: string; subject: string; segmentId?: string },
+): Promise<SavedBroadcastDecision> {
+  let current: BroadcastDetails;
   try {
     current = await getBroadcast(config, id);
   } catch (error) {
@@ -476,8 +516,20 @@ export async function checkSavedBroadcast(config: SmtpfastConfig, id: string): P
     if (error instanceof SmtpfastError && error.status === 404) return { action: "create" };
     throw error;
   }
-  if (current.status === "draft") return { action: "reuse", id };
   const url = current.url;
+  if (current.status === "draft") {
+    // A draft can be edited in the dashboard; never send one that no longer matches this run.
+    const changes: string[] = [];
+    const audience = current.audience === "segment" ? `segment ${current.segmentId ?? "(none)"}` : current.audience ?? "unknown";
+    const wanted = expected.segmentId ? `segment ${expected.segmentId}` : "all_contacts";
+    if (audience !== wanted) changes.push(`audience is ${audience}, this run wants ${wanted}`);
+    if (current.from !== expected.from) changes.push(`sender is ${current.from ?? "(none)"}, this run wants ${expected.from}`);
+    if (current.subject !== expected.subject.slice(0, 255)) changes.push("the subject is different");
+    if (changes.length > 0) {
+      return { action: "stop", status: current.status, url, message: `Draft broadcast ${id} was changed in SMTPfast: ${changes.join("; ")}.` };
+    }
+    return { action: "reuse", id };
+  }
   if (BROADCAST_SENT_STATUSES.has(current.status)) {
     return { action: "stop", status: current.status, url, message: `This email already went out as broadcast ${id} (${current.status}).` };
   }
