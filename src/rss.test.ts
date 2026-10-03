@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { renderHtml } from "./render.js";
 import { decodeFeedBody, discoverFeedUrl, loadRssFeed } from "./rss.js";
 
 const rssXml = `<?xml version="1.0"?>
@@ -203,6 +204,75 @@ describe("loadRssFeed", () => {
     expect(item.title).toBe("A & B");
     expect(item.url).toBe("https://example.com/a-and-b");
     expect(item.date).toBe("2026-05-01T10:00:00Z");
+  });
+});
+
+describe("loadRssFeed text and link handling", () => {
+  it("decodes entities in an autodiscovered feed href", async () => {
+    serve({
+      "https://blog.example.com/": {
+        body: '<html><head><link rel="alternate" type="application/rss+xml" href="/feed?format=rss&amp;category=dev"></head></html>',
+        contentType: "text/html",
+      },
+      "https://blog.example.com/feed?format=rss&category=dev": { body: rssXml },
+    });
+    await expect(loadRssFeed({ url: "https://blog.example.com/", limit: 5 })).resolves.toHaveLength(2);
+  });
+
+  it("does not decode plain text twice", async () => {
+    mockFetch(`<feed xmlns="http://www.w3.org/2005/Atom">
+      <entry><title type="text">Understanding &amp;lt;</title><link href="https://example.com/a" /><summary>Use &amp;amp; wisely</summary></entry>
+      <entry><title type="html">Bold &lt;b&gt;move&lt;/b&gt; &amp;amp; more</title><link href="https://example.com/b" /></entry>
+    </feed>`);
+    const [a, b] = await loadRssFeed({ url: "https://example.com/atom.xml", limit: 5 });
+    expect(a.title).toBe("Understanding &lt;");
+    expect(a.summary).toBe("Use &amp; wisely");
+    expect(b.title).toBe("Bold move & more");
+
+    mockFetch(`<rss version="2.0"><channel><item><title>Escaping &amp;lt; in XML</title><link>https://example.com/x</link></item></channel></rss>`);
+    const [rss] = await loadRssFeed({ url: "https://example.com/feed.xml", limit: 5 });
+    expect(rss.title).toBe("Escaping &lt; in XML");
+  });
+
+  it("reduces a malicious summary to harmless text", async () => {
+    mockFetch(`<rss version="2.0"><channel><item><title>Hi</title><link>https://example.com/h</link>
+      <description><![CDATA[<script>alert(1)</script><img src=x onerror="alert(1)"><a href="javascript:alert(1)">click</a> &lt;script&gt;alert(2)&lt;/script&gt;]]></description>
+    </item></channel></rss>`);
+    const items = await loadRssFeed({ url: "https://example.com/feed.xml", limit: 5 });
+    expect(items[0].summary).toBe("click <script>alert(2)</script>");
+    const html = renderHtml({ title: "t", preheader: "", intro: "", sourceLabel: "s", generatedAt: "2026-05-31T00:00:00Z", items });
+    expect(html).not.toMatch(/<script/i);
+    expect(html).not.toContain("onerror");
+    expect(html).not.toContain("javascript:");
+    expect(html).toContain("&lt;script&gt;alert(2)&lt;/script&gt;");
+  });
+
+  it("decodes entities in quoted link and image attributes", async () => {
+    mockFetch(`<feed xmlns="http://www.w3.org/2005/Atom"><entry>
+      <title>Quoted</title>
+      <link href="https://example.com/post?id=1&amp;ref=feed" />
+      <content type="html">&lt;img alt='say "cheese"' src='https://cdn.example.com/a.jpg?w=600&amp;amp;h=300'&gt;</content>
+    </entry></feed>`);
+    const [item] = await loadRssFeed({ url: "https://example.com/atom.xml", limit: 5 });
+    expect(item.url).toBe("https://example.com/post?id=1&ref=feed");
+    expect(item.image).toBe("https://cdn.example.com/a.jpg?w=600&h=300");
+    const html = renderHtml({ title: "t", preheader: "", intro: "", sourceLabel: "s", generatedAt: "2026-05-31T00:00:00Z", items: [item] });
+    expect(html).toContain('src="https://cdn.example.com/a.jpg?w=600&amp;h=300"');
+    expect(html).toContain('href="https://example.com/post?id=1&amp;ref=feed"');
+  });
+
+  it("drops javascript: and data: links and images", async () => {
+    mockFetch(`<rss version="2.0" xmlns:media="http://search.yahoo.com/mrss/"><channel>
+      <item><title>JS</title><link> JavaScript:alert(1) </link><media:content url="javascript:alert(1)" /></item>
+      <item><title>Data</title><link>data:text/html;base64,PHNjcmlwdD4=</link><guid>javascript:alert(2)</guid></item>
+    </channel></rss>`);
+    const items = await loadRssFeed({ url: "https://example.com/feed.xml", limit: 5 });
+    expect(items.map((i) => [i.url, i.image])).toEqual([
+      [undefined, undefined],
+      [undefined, undefined],
+    ]);
+    const html = renderHtml({ title: "t", preheader: "", intro: "", sourceLabel: "s", generatedAt: "2026-05-31T00:00:00Z", items });
+    expect(html).not.toMatch(/javascript:|data:text/i);
   });
 });
 

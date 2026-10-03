@@ -7,7 +7,7 @@ export function asArray<T>(value: T | T[] | undefined): T[] {
 }
 
 const NAMED_ENTITIES: Record<string, string> = {
-  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ",
+  amp: "&", lt: "<", gt: ">", quot: '"', apos: "'", nbsp: " ", AMP: "&", LT: "<", GT: ">", QUOT: '"',
   hellip: "\u2026", mdash: "\u2014", ndash: "\u2013", minus: "\u2212",
   lsquo: "\u2018", rsquo: "\u2019", sbquo: "\u201a", ldquo: "\u201c", rdquo: "\u201d", bdquo: "\u201e",
   laquo: "\u00ab", raquo: "\u00bb", lsaquo: "\u2039", rsaquo: "\u203a",
@@ -18,6 +18,7 @@ const NAMED_ENTITIES: Record<string, string> = {
   aacute: "\u00e1", eacute: "\u00e9", iacute: "\u00ed", oacute: "\u00f3", uacute: "\u00fa",
   Aacute: "\u00c1", Eacute: "\u00c9", Iacute: "\u00cd", Oacute: "\u00d3", Uacute: "\u00da",
   agrave: "\u00e0", egrave: "\u00e8", igrave: "\u00ec", ograve: "\u00f2", ugrave: "\u00f9",
+  Agrave: "\u00c0", Egrave: "\u00c8", Igrave: "\u00cc", Ograve: "\u00d2", Ugrave: "\u00d9",
   acirc: "\u00e2", ecirc: "\u00ea", icirc: "\u00ee", ocirc: "\u00f4", ucirc: "\u00fb",
   auml: "\u00e4", euml: "\u00eb", iuml: "\u00ef", ouml: "\u00f6", uuml: "\u00fc", yuml: "\u00ff",
   Auml: "\u00c4", Ouml: "\u00d6", Uuml: "\u00dc", szlig: "\u00df",
@@ -33,9 +34,8 @@ export function decodeEntities(value: string): string {
       if (!Number.isFinite(code) || code <= 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return match;
       return String.fromCodePoint(code);
     }
-    if (Object.hasOwn(NAMED_ENTITIES, ref)) return NAMED_ENTITIES[ref];
-    const lower = ref.toLowerCase();
-    return Object.hasOwn(NAMED_ENTITIES, lower) ? NAMED_ENTITIES[lower] : match;
+    // Entity names are case-sensitive: &Egrave; and &egrave; are different letters.
+    return Object.hasOwn(NAMED_ENTITIES, ref) ? NAMED_ENTITIES[ref] : match;
   });
 }
 

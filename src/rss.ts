@@ -12,21 +12,70 @@ const DEFAULT_TIMEOUT_MS = 15000;
 const SUMMARY_MAX_LENGTH = 300;
 const USER_AGENT = "feedletter/0.2 (+https://github.com/smtpfast/feedletter)";
 
+// htmlEntities makes the parser decode character references (&#8217;) and
+// named entities exactly once, as XML requires. CDATA is kept apart so text
+// that arrives as raw HTML can be told from text that was already decoded.
 const parser = new XMLParser({
   ignoreAttributes: false,
   attributeNamePrefix: "",
   textNodeName: "text",
+  cdataPropName: "__cdata",
+  htmlEntities: true,
+  parseTagValue: false,
 });
 
-function firstText(...values: unknown[]) {
-  for (const value of values) {
-    if (typeof value === "string" && value.trim()) return value.trim();
-    if (typeof value === "object" && value !== null && "text" in value) {
-      const text = String((value as { text?: unknown }).text ?? "").trim();
-      if (text) return text;
+interface TextNode {
+  text: string;
+  /** The text came from a CDATA section, so entities in it were not decoded. */
+  cdata: boolean;
+  /** Atom's type attribute: text (the default), html, or xhtml. */
+  type?: string;
+}
+
+function textNode(value: unknown): TextNode | undefined {
+  if (Array.isArray(value)) {
+    for (const entry of value) {
+      const node = textNode(entry);
+      if (node) return node;
     }
+    return undefined;
+  }
+  if (typeof value === "string") return value.trim() ? { text: value.trim(), cdata: false } : undefined;
+  if (typeof value === "object" && value !== null) {
+    const record = value as Record<string, unknown>;
+    const cdata = asArray(record.__cdata).filter((part) => typeof part === "string").join("");
+    const text = typeof record.text === "string" ? record.text : "";
+    const combined = `${text}${cdata}`.trim();
+    if (!combined) return undefined;
+    return { text: combined, cdata: cdata.trim() !== "", type: typeof record.type === "string" ? record.type.toLowerCase() : undefined };
   }
   return undefined;
+}
+
+function firstNode(...values: unknown[]) {
+  for (const value of values) {
+    const node = textNode(value);
+    if (node) return node;
+  }
+  return undefined;
+}
+
+function firstText(...values: unknown[]) {
+  return firstNode(...values)?.text;
+}
+
+const collapse = (value: string) => value.replace(/\s+/g, " ").trim();
+
+/** RSS plain text: already decoded by the parser, except inside CDATA, where publishers write HTML entities. */
+function rssPlain(node: TextNode | undefined) {
+  if (!node) return "";
+  return collapse(node.cdata ? decodeEntities(node.text) : node.text);
+}
+
+/** Atom text constructs: type="html" and "xhtml" are markup; "text" (the default) is literal. */
+function atomText(node: TextNode | undefined) {
+  if (!node) return "";
+  return node.type === "html" || node.type === "xhtml" ? cleanText(node.text) : collapse(node.text);
 }
 
 function atomLink(value: unknown): string | undefined {
@@ -62,23 +111,20 @@ function rssLink(item: Record<string, unknown>, baseUrl: string): string | undef
   return isHttpUrl(guid) ? resolveUrl(guid, baseUrl) : undefined;
 }
 
-/** Titles and names are plain text: decode entities, but keep "<" sequences as written. */
-function plainText(value: string | undefined) {
-  return value ? decodeEntities(value).replace(/\s+/g, " ").trim() : "";
-}
-
-function itemTitle(...values: unknown[]) {
-  return plainText(firstText(...values)) || "Untitled";
-}
-
-function itemSummary(...values: unknown[]) {
+/** RSS descriptions are HTML: strip tags, decode entities, and cut to card length. */
+function rssSummary(...values: unknown[]) {
   return truncateText(cleanText(firstText(...values)), SUMMARY_MAX_LENGTH);
 }
 
-function authorName(value: unknown): string | undefined {
+function atomSummary(...values: unknown[]) {
+  return truncateText(atomText(firstNode(...values)), SUMMARY_MAX_LENGTH);
+}
+
+function authorName(value: unknown, atom: boolean): string | undefined {
   const first = asArray(value)[0];
   const name = typeof first === "object" && first !== null && "name" in first ? (first as { name?: unknown }).name : first;
-  return plainText(firstText(name)) || undefined;
+  const node = textNode(name);
+  return (atom ? atomText(node) : rssPlain(node)) || undefined;
 }
 
 function records(value: unknown): Record<string, unknown>[] {
@@ -99,9 +145,12 @@ function imageUrlFrom(value: unknown): string | undefined {
 
 function imageFromHtml(...values: unknown[]): string | undefined {
   for (const value of values) {
-    if (typeof value === "string") {
-      const match = value.match(/<img[^>]+src=["']([^"']+)["']/i);
-      if (match && /^https?:\/\//i.test(match[1])) return match[1];
+    const html = textNode(value)?.text;
+    if (!html) continue;
+    for (const tag of html.match(/<img\b[^>]*>/gi) ?? []) {
+      const match = /\ssrc\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i.exec(tag);
+      const src = match ? decodeEntities((match[1] ?? match[2] ?? match[3] ?? "").trim()) : "";
+      if (/^https?:\/\//i.test(src)) return src;
     }
   }
   return undefined;
@@ -148,7 +197,7 @@ export function discoverFeedUrl(html: string, pageUrl: string): string | undefin
   for (const tag of html.match(/<link\b[^>]*>/gi) ?? []) {
     const attrs: Record<string, string> = {};
     for (const match of tag.matchAll(/([a-z-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/gi)) {
-      attrs[match[1].toLowerCase()] = match[2] ?? match[3] ?? match[4] ?? "";
+      attrs[match[1].toLowerCase()] = decodeEntities(match[2] ?? match[3] ?? match[4] ?? "");
     }
     const rel = (attrs.rel ?? "").toLowerCase().split(/\s+/);
     if (rel.includes("alternate") && /application\/(rss|atom)\+xml/i.test(attrs.type ?? "") && attrs.href) {
@@ -248,12 +297,12 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
     const rawItems = rss?.channel ? rss.channel.item : rdf?.item;
     return sortByDateDesc(
       records(rawItems).map((item) => ({
-        title: itemTitle(item.title),
+        title: rssPlain(textNode(item.title)) || "Untitled",
         url: rssLink(item, base),
-        summary: itemSummary(item.description, item["content:encoded"]),
+        summary: rssSummary(item.description, item["content:encoded"]),
         content: firstText(item["content:encoded"], item.description),
         date: firstText(item.pubDate, item["dc:date"], item.isoDate),
-        author: authorName(item["dc:creator"] ?? item.author),
+        author: authorName(item["dc:creator"] ?? item.author, false),
         source: feedUrl,
         image: firstImage(item),
       })),
@@ -265,13 +314,13 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
       records(atom.entry).map((entry) => {
         const link = atomLink(entry.link);
         return {
-          title: itemTitle(entry.title),
+          title: atomText(textNode(entry.title)) || "Untitled",
           url: link ? resolveUrl(link, base) : undefined,
-          summary: itemSummary(entry.summary, entry.content),
+          summary: atomSummary(entry.summary, entry.content),
           content: firstText(entry.content, entry.summary),
           // published is when the post went out; updated moves on every small edit.
           date: firstText(entry.published, entry.updated),
-          author: authorName(entry.author),
+          author: authorName(entry.author, true),
           source: feedUrl,
           image: firstImage(entry),
         };

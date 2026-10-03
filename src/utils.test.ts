@@ -6,6 +6,10 @@ describe("decodeEntities", () => {
     expect(decodeEntities("Here&#8217;s &#x2014; &amp; &hellip; caf&eacute;")).toBe("Here’s — & … café");
   });
 
+  it("treats entity names as case-sensitive", () => {
+    expect(decodeEntities("&Egrave; &egrave; &AMP; &Amp;")).toBe("\u00c8 \u00e8 & &Amp;");
+  });
+
   it("leaves unknown names and inherited object keys alone", () => {
     expect(decodeEntities("&notanentity; &constructor; &toString;")).toBe("&notanentity; &constructor; &toString;");
   });

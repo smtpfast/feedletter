@@ -18,6 +18,19 @@ const issue: DigestIssue = {
   ],
 };
 
+function withTimeZones(check: (tz: string) => void) {
+  const previous = process.env.TZ;
+  try {
+    for (const tz of ["America/Los_Angeles", "UTC", "Asia/Tokyo"]) {
+      process.env.TZ = tz;
+      check(tz);
+    }
+  } finally {
+    if (previous === undefined) delete process.env.TZ;
+    else process.env.TZ = previous;
+  }
+}
+
 describe("renderers", () => {
   it("renders email html", () => {
     const html = renderHtml(issue);
@@ -57,17 +70,18 @@ describe("renderers", () => {
   });
 
   it("shows a date-only value as the same day in every time zone", () => {
-    const previous = process.env.TZ;
-    try {
-      for (const tz of ["America/Los_Angeles", "UTC", "Asia/Tokyo"]) {
-        process.env.TZ = tz;
-        const html = renderHtml({ ...issue, items: [{ title: "Dated", date: "2026-05-30" }, { title: "Yaml", date: "2026-05-30T00:00:00.000Z" }] });
-        expect(html.match(/May 30, 2026/g)).toHaveLength(2);
-      }
-    } finally {
-      if (previous === undefined) delete process.env.TZ;
-      else process.env.TZ = previous;
-    }
+    withTimeZones((tz) => {
+      const html = renderHtml({ ...issue, items: [{ title: "Dated", date: "2026-05-30" }] });
+      expect(html, tz).toContain("May 30, 2026");
+    });
+  });
+
+  it("formats a real midnight timestamp as an instant, like any other time", () => {
+    withTimeZones((tz) => {
+      const utcMidnight = renderHtml({ ...issue, items: [{ title: "A", date: "2026-05-30T00:00:00Z" }] });
+      const sameInstant = renderHtml({ ...issue, items: [{ title: "A", date: "2026-05-29T17:00:00-07:00" }] });
+      expect(utcMidnight, tz).toBe(sameInstant);
+    });
   });
 
   it("pads the preheader and only renders it when set", () => {

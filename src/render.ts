@@ -13,9 +13,10 @@ function formatDate(value?: string) {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
-  // A date with no time (2026-05-30, or midnight UTC from YAML) is a calendar
-  // day. Format it in UTC so it is not shown as the day before west of UTC.
-  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value.trim()) || /T00:00(:00(\.0+)?)?(Z|[+-]00:?00)$/.test(value.trim());
+  // A date with no time (2026-05-30) is a calendar day, which JavaScript parses
+  // as midnight UTC. Format it in UTC so it is not shown as the day before west
+  // of UTC. Real timestamps, midnight included, are formatted as instants.
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
   return new Intl.DateTimeFormat("en", {
     year: "numeric",
     month: "short",
