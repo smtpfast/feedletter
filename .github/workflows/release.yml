@@ -1,0 +1,83 @@
+name: Release
+
+# Publishes the version in package.json to npm when a matching v* tag is
+# pushed. npm proves this workflow's identity with trusted publishing (OIDC),
+# so no token is stored. Until trusted publishing is set up for the package,
+# an NPM_TOKEN secret is used instead.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+
+      - name: Check that the tag matches package.json
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if [ "v$version" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match package.json version $version"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - name: Install, check and test
+        run: |
+          npm install
+          npm run check
+          npm test
+
+      - name: Build and run the packed CLI
+        run: |
+          npm run build
+          npm pack
+          mkdir -p /tmp/feedletter-smoke
+          npm install --prefix /tmp/feedletter-smoke "./feedletter-$VERSION.tgz"
+          /tmp/feedletter-smoke/node_modules/.bin/feedletter --version | grep -qx "$VERSION"
+          /tmp/feedletter-smoke/node_modules/.bin/feedletter build --content examples/content --base-url https://example.com --out /tmp/feedletter-smoke/out
+          test -s /tmp/feedletter-smoke/out/email.html
+
+      # Trusted publishing needs npm 11.5.1 or later; Node 22 ships npm 10.
+      - name: Update npm for trusted publishing
+        run: npm install -g npm@^11.5.1
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if npm view "feedletter@$VERSION" version > /dev/null 2>&1; then
+            echo "feedletter@$VERSION is already on npm, skipping"
+          else
+            npm publish --provenance --access public
+          fi
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          awk -v v="$VERSION" '
+            index($0, "## [" v "]") == 1 { found = 1; next }
+            /^## \[/ { if (found) exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+          echo "" >> release-notes.md
+          echo "Install with \`npm install -g feedletter@$VERSION\`." >> release-notes.md
+          gh release view "$TAG" > /dev/null 2>&1 || gh release create "$TAG" --title "$TAG" --notes-file release-notes.md --verify-tag

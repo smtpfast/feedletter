@@ -1,6 +1,6 @@
 {
   "name": "feedletter",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Turn an RSS feed or Markdown folder into a newsletter: curate in a browser studio and send with SMTPfast.",
   "type": "module",
   "bin": {
@@ -10,7 +10,8 @@
     "dist",
     "examples",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "tsc",
@@ -18,7 +19,8 @@
     "preview": "tsx src/cli.ts preview",
     "studio": "tsx src/cli.ts studio",
     "test": "vitest run",
-    "check": "tsc --noEmit"
+    "check": "tsc --noEmit",
+    "prepublishOnly": "npm run check && npm run build"
   },
   "keywords": [
     "newsletter",
