@@ -88,6 +88,53 @@ export class HistoryStore {
     await this.persist();
   }
 
+  /** Lowercased addresses SMTPfast already accepted for this exact send (see sendKey). */
+  sentRecipients(sendKey: string) {
+    const sent = new Set<string>();
+    const stmt = this.db.prepare("SELECT recipient FROM sent_recipients WHERE send_key = ?");
+    try {
+      stmt.bind([sendKey]);
+      while (stmt.step()) sent.add(String(stmt.get()[0]));
+    } finally {
+      stmt.free();
+    }
+    return sent;
+  }
+
+  /** Save addresses from an accepted batch, so a rerun of the same send skips them. */
+  async recordRecipients(sendKey: string, rows: Array<{ recipient: string; id?: string }>) {
+    const stmt = this.db.prepare(
+      "INSERT OR IGNORE INTO sent_recipients (send_key, recipient, email_id, sent_at) VALUES (?, ?, ?, ?)",
+    );
+    const now = new Date().toISOString();
+    try {
+      for (const row of rows) stmt.run([sendKey, row.recipient.toLowerCase(), row.id ?? null, now]);
+    } finally {
+      stmt.free();
+    }
+    await this.persist();
+  }
+
+  /** The broadcast created for this exact send, if any. */
+  broadcastFor(sendKey: string): string | undefined {
+    const stmt = this.db.prepare("SELECT broadcast_id FROM broadcasts WHERE send_key = ?");
+    try {
+      stmt.bind([sendKey]);
+      return stmt.step() ? String(stmt.get()[0]) : undefined;
+    } finally {
+      stmt.free();
+    }
+  }
+
+  async recordBroadcast(sendKey: string, broadcastId: string) {
+    this.db.run("INSERT OR REPLACE INTO broadcasts (send_key, broadcast_id, created_at) VALUES (?, ?, ?)", [
+      sendKey,
+      broadcastId,
+      new Date().toISOString(),
+    ]);
+    await this.persist();
+  }
+
   close() {
     this.db.close();
   }
@@ -110,6 +157,20 @@ export class HistoryStore {
         source TEXT,
         published_at TEXT,
         included_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS sent_recipients (
+        send_key TEXT NOT NULL,
+        recipient TEXT NOT NULL,
+        email_id TEXT,
+        sent_at TEXT NOT NULL,
+        PRIMARY KEY (send_key, recipient)
+      );
+
+      CREATE TABLE IF NOT EXISTS broadcasts (
+        send_key TEXT PRIMARY KEY,
+        broadcast_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
       );
 
       CREATE INDEX IF NOT EXISTS included_items_issue_key_idx ON included_items(issue_key);

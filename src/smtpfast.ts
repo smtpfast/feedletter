@@ -24,6 +24,8 @@ export interface SendResult {
   error?: string;
   /** SMTPfast dropped the address because it unsubscribed, bounced, or complained before. */
   suppressed?: boolean;
+  /** An earlier run of this exact send already reached this address, so it was skipped. */
+  alreadySent?: boolean;
 }
 
 /** SMTPfast accepts up to 100 emails per POST /v1/emails/batch call. */
@@ -46,6 +48,17 @@ export class SmtpfastError extends Error {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Retry-After is either seconds or an HTTP date. */
+function retryAfterMs(header: string | null, attempt: number) {
+  if (header) {
+    const seconds = Number.parseFloat(header);
+    if (Number.isFinite(seconds)) return Math.max(seconds, 0) * 1000;
+    const date = Date.parse(header);
+    if (!Number.isNaN(date)) return Math.max(date - Date.now(), 0);
+  }
+  return 1000 * 2 ** attempt;
+}
+
 function hint(status: number) {
   if (status === 401) return " Check the API key (SMTPfast dashboard, API keys).";
   if (status === 403) return " The key may lack the scope, or the From domain is not verified.";
@@ -53,9 +66,9 @@ function hint(status: number) {
 }
 
 /**
- * One call to the SMTPfast API. A 429 is retried after Retry-After: SMTPfast
- * rate-limits before it queues anything, so the retry cannot double-send.
- * Other errors are not retried.
+ * One call to the SMTPfast API. A 429 is retried after Retry-After, up to
+ * three times: SMTPfast rate-limits before it queues anything, so the retry
+ * cannot double-send. Other errors are not retried.
  */
 async function smtpfastRequest<T>(
   config: SmtpfastConfig,
@@ -79,6 +92,9 @@ async function smtpfastRequest<T>(
           ...headers,
         },
         body: body === undefined ? undefined : JSON.stringify(body),
+        // Bun's fetch replays a request once when a pooled connection drops
+        // after it was sent, which would send a batch twice. No reuse for POSTs.
+        keepalive: method === "GET",
         signal: controller.signal,
       });
       text = await response.text();
@@ -91,13 +107,17 @@ async function smtpfastRequest<T>(
       clearTimeout(timer);
     }
 
-    if (response.status === 429 && attempt < MAX_RATE_LIMIT_RETRIES) {
-      const retryAfter = Number.parseFloat(response.headers.get("retry-after") ?? "");
-      const waitMs = Number.isFinite(retryAfter) ? retryAfter * 1000 : 1000 * 2 ** attempt;
-      if (waitMs <= MAX_RETRY_WAIT_MS) {
+    let rateLimitNote = "";
+    if (response.status === 429) {
+      const waitMs = retryAfterMs(response.headers.get("retry-after"), attempt);
+      if (attempt < MAX_RATE_LIMIT_RETRIES && waitMs <= MAX_RETRY_WAIT_MS) {
         await sleep(waitMs);
         continue;
       }
+      rateLimitNote =
+        waitMs > MAX_RETRY_WAIT_MS
+          ? ` SMTPfast asked to wait ${Math.ceil(waitMs / 1000)}s; try again later.`
+          : ` Still rate-limited after ${MAX_RATE_LIMIT_RETRIES} retries; try again later.`;
     }
 
     if (!response.ok) {
@@ -109,7 +129,7 @@ async function smtpfastRequest<T>(
       } catch {
         if (text.trim()) message = `${text.trim().slice(0, 300)} (${response.status})`;
       }
-      throw new SmtpfastError(`SMTPfast: ${message}.${hint(response.status)}`.replace(/\.\./g, "."), response.status);
+      throw new SmtpfastError(`SMTPfast: ${message}.${hint(response.status)}${rateLimitNote}`.replace(/\.\./g, "."), response.status);
     }
 
     try {
@@ -160,6 +180,23 @@ interface BatchResponse {
   emails?: Array<{ id?: string; status?: string }>;
 }
 
+/** Identifies one exact send (sender, subject, and body), for the recipient checkpoint. */
+export function sendKey(message: Omit<SmtpfastMessage, "to">) {
+  return createHash("sha256").update(`${message.from}\n${message.subject}\n${message.html}\n${message.text ?? ""}`).digest("hex");
+}
+
+/**
+ * Progress of one send, kept between runs. The batch endpoint has no
+ * idempotency, so after a partial failure a rerun would send the accepted
+ * batches again; the checkpoint lets it skip addresses SMTPfast already took.
+ */
+export interface SendCheckpoint {
+  /** Lowercased addresses SMTPfast already accepted for this exact send. */
+  alreadySent: Set<string>;
+  /** Called after each accepted batch, before the next one goes out. */
+  record(accepted: SendResult[]): Promise<void> | void;
+}
+
 /**
  * Send one message per recipient so each gets their own {{unsubscribe_url}} and
  * nobody sees the rest of the list. Rows go out through the batch endpoint, up
@@ -169,39 +206,40 @@ export async function sendDigest(
   config: SmtpfastConfig,
   base: Omit<SmtpfastMessage, "to">,
   recipients: string[],
-  options: { idempotent?: boolean } = {},
+  options: { checkpoint?: SendCheckpoint } = {},
 ): Promise<SendResult[]> {
   const { valid, invalid } = checkRecipients(recipients);
   const results: SendResult[] = invalid.map((recipient) => ({ recipient, ok: false, error: "not a valid email address" }));
-  const contentHash = createHash("sha256").update(`${base.from}\n${base.subject}\n${base.html}`).digest("hex").slice(0, 24);
+  const checkpoint = options.checkpoint;
+  const pending: string[] = [];
+  for (const recipient of valid) {
+    if (checkpoint?.alreadySent.has(recipient.toLowerCase())) {
+      results.push({ recipient, ok: false, alreadySent: true, error: "already sent in an earlier run" });
+    } else {
+      pending.push(recipient);
+    }
+  }
 
   let stopError: string | undefined;
-  for (let start = 0; start < valid.length; start += BATCH_SIZE) {
-    const chunk = valid.slice(start, start + BATCH_SIZE);
+  for (let start = 0; start < pending.length; start += BATCH_SIZE) {
+    const chunk = pending.slice(start, start + BATCH_SIZE);
     if (stopError) {
       results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: `not sent: ${stopError}` })));
       continue;
     }
-    // The same content to the same chunk gets the same key, so a repeated
-    // request (a double click, a re-run) can be answered without a second send.
-    // Test sends skip it, since sending the same test twice is often on purpose.
-    const idempotencyKey = `feedletter-${contentHash}-${createHash("sha256").update(chunk.join(",")).digest("hex").slice(0, 24)}`;
-    const headers: Record<string, string> = options.idempotent === false ? {} : { "idempotency-key": idempotencyKey };
+    let accepted: SendResult[];
     try {
       const response = await smtpfastRequest<BatchResponse>(
         config,
         "POST",
         "/v1/emails/batch",
         chunk.map((recipient) => ({ ...base, to: [recipient] })),
-        headers,
       );
-      chunk.forEach((recipient, index) => {
+      accepted = chunk.map((recipient, index) => {
         const row = response.emails?.[index];
-        if (row?.status === "failed") {
-          results.push({ recipient, ok: false, suppressed: true, id: row.id, error: "suppressed (unsubscribed, bounced, or complained before)" });
-        } else {
-          results.push({ recipient, ok: true, id: row?.id });
-        }
+        return row?.status === "failed"
+          ? { recipient, ok: false, suppressed: true, id: row.id, error: "suppressed (unsubscribed, bounced, or complained before)" }
+          : { recipient, ok: true, id: row?.id };
       });
     } catch (error) {
       // A batch is all-or-nothing on SMTPfast's side, and the same content will
@@ -213,6 +251,16 @@ export async function sendDigest(
       }
       results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: message })));
       stopError = "an earlier batch failed";
+      continue;
+    }
+    results.push(...accepted);
+    if (checkpoint) {
+      try {
+        await checkpoint.record(accepted);
+      } catch (error) {
+        // Without a saved checkpoint a rerun would resend this batch, so stop here.
+        stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
+      }
     }
   }
   return results;
@@ -272,18 +320,32 @@ export interface AudienceSummary {
   broadcastsUsed?: number;
 }
 
+/** The body of GET /v1/broadcasts/audience (SMTPfast's audience route). */
 interface AudienceResponse {
-  audience?: { total?: number; eligible?: number; skipped?: number };
-  segments?: Array<{ id?: string; name?: string; contact_count?: number }>;
-  package?: { label?: string; broadcast_limit?: number; broadcasts_used?: number };
+  object?: "broadcast_audience";
+  audience_type?: "all_contacts" | "segment";
+  segment_id?: string | null;
+  audience?: { total?: number; eligible?: number; skipped?: number; unsubscribed?: number; suppressed?: number; invalid?: number };
+  domains?: Array<{ id?: string; domain?: string }>;
+  segments?: Array<{ id?: string; name?: string; color?: string | null; contact_count?: number }>;
+  package?: { tier?: string; label?: string; broadcast_limit?: number; broadcasts_used?: number };
 }
 
 /** How many contacts a broadcast would reach, the segments to choose from, and the monthly broadcast allowance. */
 export async function getAudience(config: SmtpfastConfig, segmentId?: string): Promise<AudienceSummary> {
   const query = segmentId ? `?segment_id=${encodeURIComponent(segmentId)}` : "";
-  const data = await smtpfastRequest<AudienceResponse>(config, "GET", `/v1/broadcasts/audience${query}`);
-  const total = data.audience?.total ?? 0;
-  const eligible = data.audience?.eligible ?? 0;
+  let data: AudienceResponse;
+  try {
+    data = await smtpfastRequest<AudienceResponse>(config, "GET", `/v1/broadcasts/audience${query}`);
+  } catch (error) {
+    const scope = error instanceof SmtpfastError && error.status === 403 ? " Reading the audience needs an API key with the email:read scope." : "";
+    throw new SmtpfastError(`Could not check the SMTPfast audience. ${error instanceof Error ? error.message : String(error)}${scope}`, error instanceof SmtpfastError ? error.status : undefined);
+  }
+  if (typeof data.audience?.eligible !== "number" || typeof data.audience?.total !== "number") {
+    throw new SmtpfastError("Could not check the SMTPfast audience: the response did not include audience counts.");
+  }
+  const total = data.audience.total;
+  const eligible = data.audience.eligible;
   return {
     total,
     eligible,
@@ -343,6 +405,67 @@ export async function createBroadcast(config: SmtpfastConfig, draft: BroadcastDr
   });
   if (!data.id) throw new SmtpfastError("SMTPfast did not return a broadcast id.");
   return { id: data.id, status: data.status ?? "draft", url: broadcastUrl(data.id) };
+}
+
+/** Statuses that mean the broadcast already went out, or is going out. */
+export const BROADCAST_SENT_STATUSES = new Set(["scheduled", "queued", "sending", "sent", "paused"]);
+
+/** Read a broadcast's current status. */
+export async function getBroadcast(config: SmtpfastConfig, id: string): Promise<BroadcastResult> {
+  const data = await smtpfastRequest<{ id?: string; status?: string; recipient_count?: number }>(
+    config,
+    "GET",
+    `/v1/broadcasts/${encodeURIComponent(id)}`,
+  );
+  return { id, status: data.status ?? "unknown", url: broadcastUrl(id), recipients: data.recipient_count };
+}
+
+/**
+ * Create a draft, and if SMTPfast gave no answer, look for the draft it may
+ * have created anyway, so a retry does not leave a second one behind.
+ */
+export async function createBroadcastOnce(config: SmtpfastConfig, draft: BroadcastDraft): Promise<BroadcastResult> {
+  try {
+    return await createBroadcast(config, draft);
+  } catch (error) {
+    if (!(error instanceof SmtpfastError) || error.status !== undefined) throw error;
+    const name = draft.name.slice(0, 140);
+    const since = Date.now() - 15 * 60 * 1000;
+    try {
+      const list = await smtpfastRequest<{ data?: Array<{ id?: string; name?: string; subject?: string; created_at?: string }> }>(
+        config,
+        "GET",
+        `/v1/broadcasts?status=draft&limit=20&q=${encodeURIComponent(name)}`,
+      );
+      const match = (list.data ?? []).find(
+        (b) => b.id && b.name === name && b.subject === draft.subject.slice(0, 255) && Date.parse(b.created_at ?? "") >= since,
+      );
+      if (match?.id) return { id: match.id, status: "draft", url: broadcastUrl(match.id) };
+    } catch {
+      /* fall through to the original error */
+    }
+    throw new SmtpfastError(`${error.message} If SMTPfast created the draft anyway, it is named "${name}"; check before retrying.`);
+  }
+}
+
+/**
+ * Send a draft, and if the answer is lost or an error comes back, read the
+ * broadcast before reporting failure: the send may have gone through.
+ */
+export async function sendBroadcastChecked(config: SmtpfastConfig, id: string): Promise<BroadcastResult & { recovered?: boolean }> {
+  try {
+    return await sendBroadcast(config, id);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    let current: BroadcastResult;
+    try {
+      current = await getBroadcast(config, id);
+    } catch {
+      throw new SmtpfastError(`${message} Broadcast ${id} may have been sent; check ${broadcastUrl(id)} before sending again.`);
+    }
+    if (BROADCAST_SENT_STATUSES.has(current.status)) return { ...current, recovered: true };
+    throw new SmtpfastError(`${message} Broadcast ${id} was not sent (status: ${current.status}); the draft is at ${current.url}.`);
+  }
 }
 
 /** Send a broadcast draft now to its audience. */

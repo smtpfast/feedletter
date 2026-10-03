@@ -408,7 +408,35 @@ iframe{width:100%;height:100%;border:0;display:block;background:#e9edf2}
 }
 `;
 
+/**
+ * The send buttons' state machine, kept as source so the page and the tests
+ * run the same code.
+ */
+export const SEND_GUARD_SOURCE = `
+function createSendGuard(){
+  let armed = null;
+  let inFlight = null;
+  return {
+    // Returns "busy" while a send runs, "confirmed" on a second press for the
+    // same action and audience token, and "armed" otherwise.
+    press(action, token){
+      if(inFlight) return "busy";
+      if(armed && armed.action===action && armed.token===token){ armed = null; return "confirmed"; }
+      armed = { action, token };
+      return "armed";
+    },
+    disarm(){ const was = armed!==null; armed = null; return was; },
+    isArmed(action){ return armed!==null && armed.action===action; },
+    // Claims the single send slot; false if another send is already running.
+    start(action){ if(inFlight) return false; inFlight = action; armed = null; return true; },
+    finish(){ inFlight = null; },
+    busy(){ return inFlight; },
+  };
+}
+`;
+
 const SCRIPT = `
+${SEND_GUARD_SOURCE}
 const cfg = window.__CONFIG__;
 const $ = (id) => document.getElementById(id);
 const state = { sourceType:"rss", sourceLabel:"Digest", items:[], activeTab:"email", lastHtml:"", lastText:"" };
@@ -733,7 +761,16 @@ async function verifyFrom(){
 }
 
 // ---- send to: SMTPfast contacts (broadcast) or a list of addresses ----
+// One guard for every send button: a send needs two presses for the same
+// audience, and nothing starts while another send is in flight.
+const guard = createSendGuard();
+let armTimer = null;
+state.audience = null;
+state.audienceLoading = false;
+state.audienceVersion = 0;
+
 function setMode(mode){
+  disarmSend();
   state.sendMode = mode;
   $("modeContacts").classList.toggle("active", mode==="contacts");
   $("modeList").classList.toggle("active", mode==="list");
@@ -747,76 +784,107 @@ function setMode(mode){
 $("modeContacts").onclick = ()=> setMode("contacts");
 $("modeList").onclick = ()=> setMode("list");
 
-// Two clicks to send: the first arms the button and states the count, the second sends.
-function confirmThen(btn, confirmText, action){
-  if(btn.dataset.armed==="1"){ disarm(btn); action(); return; }
-  btn.dataset.label = btn.textContent; btn.dataset.armed = "1";
-  btn.textContent = confirmText; btn.classList.add("armed");
-  btn._disarm = setTimeout(()=> disarm(btn), 6000);
-}
-function disarm(btn){
-  if(btn.dataset.armed!=="1") return;
-  clearTimeout(btn._disarm); btn.dataset.armed = "";
-  btn.textContent = btn.dataset.label; btn.classList.remove("armed");
-}
-function setLabel(btn, text){ if(btn.dataset.armed==="1") btn.dataset.label = text; else btn.textContent = text; }
 function fmt(n){ return Number(n||0).toLocaleString("en"); }
 function plural(n, word){ return fmt(n) + " " + word + (n===1 ? "" : "s"); }
+function audienceCapped(a){ return !!a && a.broadcastLimit!==undefined && a.broadcastsUsed!==undefined && a.broadcastsUsed >= a.broadcastLimit; }
+function listToken(c){ return "list:" + c.valid.join(",").toLowerCase(); }
+function audienceToken(){ return "contacts:" + state.audienceVersion; }
+
+function disarmSend(){ guard.disarm(); clearTimeout(armTimer); refreshSendButtons(); }
+// First press arms and states the count; a second press for the same audience sends.
+function pressSend(action, token, run){
+  const step = guard.press(action, token);
+  if(step==="busy") return;
+  clearTimeout(armTimer);
+  if(step==="armed"){ armTimer = setTimeout(disarmSend, 6000); refreshSendButtons(); return; }
+  run();
+}
+
+// Every send button's label and enabled state comes from here, so an in-flight
+// send keeps all of them disabled until it finishes.
+function refreshSendButtons(){
+  const busy = guard.busy();
+  const c = checkList($("recipients").value);
+  const listBtn = $("sendBtn");
+  listBtn.disabled = !!busy || c.valid.length===0;
+  listBtn.classList.toggle("armed", guard.isArmed("list"));
+  if(busy!=="list"){
+    listBtn.textContent = guard.isArmed("list") ? "Click again to send to " + plural(c.valid.length, "recipient")
+      : (c.valid.length ? "Send to " + plural(c.valid.length, "recipient") : "Send digest");
+  }
+  const a = state.audience;
+  const bc = $("broadcastBtn");
+  bc.disabled = !!busy || state.audienceLoading || !a || a.eligible===0 || audienceCapped(a);
+  bc.classList.toggle("armed", guard.isArmed("broadcast"));
+  if(busy!=="broadcast"){
+    bc.textContent = guard.isArmed("broadcast") && a ? "Click again to send to " + plural(a.eligible, "contact")
+      : (a && a.eligible ? "Send to " + plural(a.eligible, "contact") : "Send to contacts");
+  }
+  $("draftBtn").disabled = !!busy;
+  if(busy!=="draft") $("draftBtn").textContent = "Save as draft";
+  $("sendTestBtn").disabled = !!busy;
+  if(busy!=="test") $("sendTestBtn").textContent = "Send test";
+}
 
 // ---- audience (SMTPfast contacts and segments) ----
 let audienceTimer = null, audienceSeq = 0;
-state.audience = null;
+// Any change to the key or segment cancels a pending confirmation and blocks
+// sending until the new audience has loaded.
+function audienceChanged(){
+  guard.disarm(); clearTimeout(armTimer);
+  state.audienceVersion++;
+  state.audience = null;
+  refreshSendButtons();
+}
 function scheduleAudience(){ clearTimeout(audienceTimer); audienceTimer = setTimeout(loadAudience, 600); }
-$("apiKey").addEventListener("input", ()=>{ state.segments = null; scheduleAudience(); });
-$("audienceSelect").addEventListener("change", loadAudience);
+$("apiKey").addEventListener("input", ()=>{ state.segments = null; audienceChanged(); scheduleAudience(); });
+$("audienceSelect").addEventListener("change", ()=>{ audienceChanged(); loadAudience(); });
 async function loadAudience(){
   if(state.sendMode!=="contacts" || $("sendOverlay").hidden) return;
   const info = $("audienceInfo"); const key = $("apiKey").value.trim();
-  if(!key){ info.className = "audience-info"; info.textContent = "Paste your API key to see your contacts."; state.audience = null; updateBroadcastButtons(); return; }
+  audienceChanged();
+  if(!key){ info.className = "audience-info"; info.textContent = "Paste your API key to see your contacts."; return; }
   const seq = ++audienceSeq;
+  state.audienceLoading = true; refreshSendButtons();
   info.className = "audience-info"; info.textContent = "Checking your contacts…";
   try{
     const res = await fetch("/api/audience",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({apiKey:key, segmentId:$("audienceSelect").value})});
     const d = await res.json();
     if(seq!==audienceSeq) return;
-    if(!res.ok) throw new Error(d.error||"Could not load contacts");
+    if(!res.ok) throw new Error(d.error||"Could not check your contacts.");
     if(!state.segments){
       state.segments = d.segments || [];
       const sel = $("audienceSelect"); const current = sel.value;
       sel.innerHTML = '<option value="">All contacts</option>' + state.segments.map((g)=> '<option value="'+escapeHtml(g.id)+'">'+escapeHtml(g.name)+' ('+fmt(g.contactCount)+')</option>').join("");
       sel.value = current;
     }
+    state.audienceVersion++;
     state.audience = d;
     const parts = [plural(d.eligible, "contact") + " will get it"];
     if(d.skipped) parts[0] += " (" + fmt(d.skipped) + " skipped: unsubscribed, suppressed, or invalid)";
-    const capped = d.broadcastLimit!==undefined && d.broadcastsUsed!==undefined && d.broadcastsUsed >= d.broadcastLimit;
     if(d.broadcastLimit!==undefined) parts.push("Broadcasts this month: " + fmt(d.broadcastsUsed) + " of " + fmt(d.broadcastLimit) + (d.planLabel ? " (" + d.planLabel + " plan)" : ""));
     if(d.eligible===0) parts.push("No subscribed contacts yet. Add contacts in SMTPfast, or switch to a list of addresses.");
-    if(capped) parts.push("This month's broadcasts are used up. You can still save a draft or send to a list.");
-    info.className = "audience-info" + (d.eligible===0 || capped ? " warn" : "");
+    if(audienceCapped(d)) parts.push("This month's broadcasts are used up. You can still save a draft or send to a list.");
+    info.className = "audience-info" + (d.eligible===0 || audienceCapped(d) ? " warn" : "");
     info.textContent = parts.join(". ") + ".";
   }catch(e){
     if(seq!==audienceSeq) return;
     state.audience = null;
-    info.className = "audience-info warn"; info.textContent = e.message;
+    info.className = "audience-info warn";
+    info.textContent = e.message + " Sending to contacts needs this check; you can still save a draft.";
+  }finally{
+    if(seq===audienceSeq){ state.audienceLoading = false; refreshSendButtons(); }
   }
-  updateBroadcastButtons();
-}
-function updateBroadcastButtons(){
-  const a = state.audience;
-  const capped = a && a.broadcastLimit!==undefined && a.broadcastsUsed!==undefined && a.broadcastsUsed >= a.broadcastLimit;
-  $("broadcastBtn").disabled = !a || a.eligible===0 || capped;
-  setLabel($("broadcastBtn"), a && a.eligible ? "Send to " + plural(a.eligible, "contact") : "Send to contacts");
 }
 $("draftBtn").onclick = ()=> doBroadcast(false);
-$("broadcastBtn").onclick = ()=>{
-  const a = state.audience; if(!a) return;
-  confirmThen($("broadcastBtn"), "Click again to send to " + plural(a.eligible, "contact"), ()=> doBroadcast(true));
-};
+$("broadcastBtn").onclick = ()=>{ if(state.audience) pressSend("broadcast", audienceToken(), ()=> doBroadcast(true)); };
 async function doBroadcast(sendNow){
+  const action = sendNow ? "broadcast" : "draft";
+  if(!guard.start(action)) return;
   const out = $("sendResult"); out.hidden = false; out.className = "send-result";
   const btn = sendNow ? $("broadcastBtn") : $("draftBtn");
-  btn.disabled = true; const label = btn.textContent; btn.innerHTML = '<span class="spin"></span> ' + (sendNow ? "Sending…" : "Saving…");
+  refreshSendButtons();
+  btn.innerHTML = '<span class="spin"></span> ' + (sendNow ? "Sending…" : "Saving…");
   try{
     rememberKey();
     const res = await fetch("/api/broadcast",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({
@@ -827,17 +895,18 @@ async function doBroadcast(sendNow){
     const link = ' <a href="'+escapeHtml(d.url)+'" target="_blank" rel="noopener">Open it in SMTPfast</a>.';
     out.classList.add("ok");
     if(sendNow){
-      out.innerHTML = "<strong>Broadcast " + escapeHtml(d.status||"queued") + (d.recipients!==undefined ? " to " + plural(d.recipients, "contact") : "") + ".</strong>" + link;
+      out.innerHTML = "<strong>Broadcast " + escapeHtml(d.status||"queued") + (d.recipients!==undefined ? " to " + plural(d.recipients, "contact") : "") + ".</strong>"
+        + (d.recovered ? " The answer to the send was lost, but SMTPfast shows it as sent." : "") + link;
       setStatus("Broadcast sent","ok"); markSent();
     } else {
-      out.innerHTML = "<strong>Draft saved in SMTPfast.</strong> Review it and press Send there." + link;
+      out.innerHTML = "<strong>" + (d.reused ? "This draft is already in SMTPfast." : "Draft saved in SMTPfast.") + "</strong> Review it and press Send there." + link;
       setStatus("Draft saved in SMTPfast","ok");
     }
   }catch(e){
     out.classList.add("err");
-    out.innerHTML = escapeHtml(e.message) + (e.url ? ' <a href="'+escapeHtml(e.url)+'" target="_blank" rel="noopener">Open the draft</a>.' : "");
+    out.innerHTML = escapeHtml(e.message) + (e.url ? ' <a href="'+escapeHtml(e.url)+'" target="_blank" rel="noopener">Open the broadcast</a>.' : "");
     setStatus(sendNow ? "Broadcast failed" : "Draft failed","err");
-  }finally{ btn.textContent = label; updateBroadcastButtons(); $("draftBtn").disabled = false; }
+  }finally{ guard.finish(); refreshSendButtons(); }
 }
 
 // ---- recipient list: live count and validation (same check SMTPfast applies) ----
@@ -862,12 +931,11 @@ function updateRecipientInfo(){
   if(c.invalid.length) parts.push(fmt(c.invalid.length) + " not valid and skipped: " + c.invalid.slice(0,5).join(", ") + (c.invalid.length>5 ? ", …" : ""));
   info.textContent = parts.join(" · ");
   info.className = "audience-info" + (c.invalid.length ? " warn" : "");
-  $("sendBtn").disabled = c.valid.length===0;
-  setLabel($("sendBtn"), c.valid.length ? "Send to " + plural(c.valid.length, "recipient") : "Send digest");
+  refreshSendButtons();
   return c;
 }
 // Editing the list cancels a pending confirmation, since the count may have changed.
-$("recipients").addEventListener("input", ()=>{ disarm($("sendBtn")); updateRecipientInfo(); });
+$("recipients").addEventListener("input", ()=>{ guard.disarm(); clearTimeout(armTimer); updateRecipientInfo(); });
 
 function fromHeader(){
   const name = $("fromName").value.trim(); const addr = $("fromAddr").value.trim();
@@ -880,13 +948,16 @@ function rememberKey(){
 // ---- send (digest to the list, or a test to yourself) ----
 $("sendBtn").onclick = ()=>{
   const c = checkList($("recipients").value); if(!c.valid.length) return;
-  confirmThen($("sendBtn"), "Click again to send to " + plural(c.valid.length, "recipient"), ()=> doSend(false));
+  pressSend("list", listToken(c), ()=> doSend(false));
 };
 $("sendTestBtn").onclick = ()=> doSend(true);
 async function doSend(isTest){
+  const action = isTest ? "test" : "list";
+  if(!guard.start(action)) return;
   const out = $("sendResult"); out.hidden=false; out.className="send-result";
   const btn = isTest ? $("sendTestBtn") : $("sendBtn");
-  btn.disabled=true; const label=btn.textContent; btn.innerHTML='<span class="spin"></span> Sending…';
+  refreshSendButtons();
+  btn.innerHTML='<span class="spin"></span> Sending…';
   try{
     rememberKey();
     const recipients = isTest ? $("testTo").value : $("recipients").value;
@@ -894,14 +965,16 @@ async function doSend(isTest){
     const res = await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"Send failed");
-    const failed = (data.results||[]).filter((r)=>!r.ok);
+    const failed = (data.results||[]).filter((r)=>!r.ok && !r.suppressed && !r.alreadySent);
     out.classList.add(data.failed? "err":"ok");
-    out.innerHTML = "<strong>"+(isTest?"Test sent":"Sent")+" to "+data.sent+(data.skipped ? ", skipped "+data.skipped+" suppressed" : "")+", failed "+data.failed+".</strong>"
+    out.innerHTML = "<strong>"+(isTest?"Test sent":"Sent")+" to "+data.sent
+      + (data.alreadySent ? ", skipped "+data.alreadySent+" already sent earlier" : "")
+      + (data.skipped ? ", skipped "+data.skipped+" suppressed" : "")+", failed "+data.failed+".</strong>"
       + (failed.length? "<ul>"+failed.slice(0,20).map((r)=>"<li>"+escapeHtml(r.recipient)+": "+escapeHtml(r.error||"")+"</li>").join("")+(failed.length>20 ? "<li>and "+(failed.length-20)+" more</li>" : "")+"</ul>" : "");
     setStatus(data.failed? "Sent with "+data.failed+" errors" : (isTest?"Test sent":"Sent "+data.sent), data.failed?"err":"ok");
     if(!isTest && data.sent > 0) markSent();
   }catch(e){ out.classList.add("err"); out.textContent=e.message; setStatus(e.message,"err"); }
-  finally{ btn.textContent=label; btn.disabled=false; if(!isTest) updateRecipientInfo(); }
+  finally{ guard.finish(); refreshSendButtons(); }
 }
 function markSent(){ includedItems().forEach((i)=> i.seen = true); renderItems(); }
 

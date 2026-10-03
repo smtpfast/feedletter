@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
 import { isLoopbackHost, rejectForeignRequest, startStudioServer } from "./studio.js";
+import { SEND_GUARD_SOURCE } from "./studio-ui.js";
 
 let studio: Server;
 let mock: Server;
@@ -15,6 +16,8 @@ let contentDir: string;
 // A stand-in for the SMTPfast API so the studio's own fetch has something to hit
 // without stubbing global fetch (which the test itself uses to call the studio).
 const received: Array<{ method?: string; url?: string; body: unknown }> = [];
+const broadcasts = new Map<string, { status: string; subject: string }>();
+let broadcastSeq = 0;
 
 function startMock(): Promise<Server> {
   const server = createServer((req, res) => {
@@ -29,17 +32,40 @@ function startMock(): Promise<Server> {
       };
       if (req.method === "GET" && req.url === "/v1/domains") return json(200, [{ id: "dom_1", domain: "example.com", status: "verified" }]);
       if (req.method === "POST" && req.url === "/v1/emails/batch") {
-        return json(200, { batch_id: "b1", emails: (body as unknown[]).map((_, i) => ({ id: `email_${i}`, status: "queued" })) });
+        const rows = body as Array<{ subject?: string }>;
+        const reply = () => json(200, { batch_id: "b1", emails: rows.map((_, i) => ({ id: `email_${i}`, status: "queued" })) });
+        // "Slow" lets a test hold a send open while a second one arrives.
+        return rows[0]?.subject === "Slow" ? void setTimeout(reply, 300) : reply();
       }
       if (req.method === "GET" && req.url?.startsWith("/v1/broadcasts/audience")) {
+        // The exact body of SMTPfast's audience route.
+        const segmentId = new URL(req.url, "http://x").searchParams.get("segment_id");
         return json(200, {
-          audience: { total: 5, eligible: 4, skipped: 1 },
-          segments: [{ id: "seg_1", name: "Customers", contact_count: 2 }],
-          package: { label: "Starter", broadcast_limit: 10, broadcasts_used: 1 },
+          object: "broadcast_audience",
+          audience_type: segmentId ? "segment" : "all_contacts",
+          segment_id: segmentId,
+          audience: { total: 5, eligible: 4, skipped: 1, unsubscribed: 1, suppressed: 0, invalid: 0 },
+          domains: [{ id: "dom_1", domain: "example.com" }],
+          segments: [{ id: "seg_1", name: "Customers", color: null, contact_count: 2 }],
+          package: { tier: "starter", label: "Starter", broadcast_limit: 10, broadcasts_used: 1 },
         });
       }
-      if (req.method === "POST" && req.url === "/v1/broadcasts") return json(201, { id: "bc_1", status: "draft" });
-      if (req.method === "POST" && req.url === "/v1/broadcasts/bc_1/send") return json(200, { id: "bc_1", status: "queued", recipients: 4 });
+      if (req.method === "POST" && req.url === "/v1/broadcasts") {
+        const id = `bc_${++broadcastSeq}`;
+        broadcasts.set(id, { status: "draft", subject: (body as { subject: string }).subject });
+        return json(201, { object: "broadcast", id, status: "draft" });
+      }
+      const broadcastPath = /^\/v1\/broadcasts\/(bc_\d+)(\/send)?$/.exec(req.url ?? "");
+      if (broadcastPath && broadcasts.has(broadcastPath[1])) {
+        const record = broadcasts.get(broadcastPath[1])!;
+        if (req.method === "GET") return json(200, { object: "broadcast", id: broadcastPath[1], status: record.status, recipient_count: 4, recipients: [] });
+        if (req.method === "POST" && broadcastPath[2]) {
+          record.status = "queued";
+          // "Lost" queues the broadcast, then drops the connection before answering.
+          if (record.subject === "Lost") return void req.socket.destroy();
+          return json(200, { object: "broadcast", id: broadcastPath[1], status: "queued", recipients: 4 });
+        }
+      }
       json(404, {});
     });
   });
@@ -205,6 +231,42 @@ describe("studio server", () => {
     expect(data).toMatchObject({ status: "queued", recipients: 4 });
   });
 
+  it("refuses a second send while one is still running", async () => {
+    received.length = 0;
+    const body = { apiKey: "k", from: "news@example.com", recipients: "a@x.com", draft: { ...draft, title: "Slow" }, baseUrl: mockUrl };
+    const [first, second] = await Promise.all([post("/api/send", body), post("/api/send", body)]);
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+    expect(received.filter((r) => r.url === "/v1/emails/batch")).toHaveLength(1);
+  });
+
+  it("skips addresses an earlier run of the same send already reached", async () => {
+    const body = { apiKey: "k", from: "news@example.com", recipients: "r1@x.com, r2@x.com", draft: { ...draft, title: "Rerun" }, baseUrl: mockUrl };
+    expect((await post("/api/send", body)).data).toMatchObject({ sent: 2, alreadySent: 0 });
+    received.length = 0;
+    expect((await post("/api/send", body)).data).toMatchObject({ sent: 0, alreadySent: 2, failed: 0 });
+    expect(received.some((r) => r.url === "/v1/emails/batch")).toBe(false);
+  });
+
+  it("recovers a broadcast whose send answer was lost, and never sends it twice", async () => {
+    received.length = 0;
+    const body = { apiKey: "k", from: "news@example.com", send: true, draft: { ...draft, title: "Lost" }, baseUrl: mockUrl };
+    const first = await post("/api/broadcast", body);
+    expect(first.status).toBe(200);
+    expect(first.data).toMatchObject({ status: "queued", recovered: true });
+
+    const retry = await post("/api/broadcast", body);
+    expect(retry.status).toBe(409);
+    expect(String(retry.data.error)).toMatch(/already went out/);
+    expect(received.filter((r) => r.method === "POST" && r.url === "/v1/broadcasts")).toHaveLength(1);
+    expect(received.filter((r) => r.url?.endsWith("/send"))).toHaveLength(1);
+  });
+
+  it("explains a failed audience lookup", async () => {
+    const { status, data } = await post("/api/audience", { apiKey: "k", baseUrl: `${mockUrl}/missing` });
+    expect(status).toBe(502);
+    expect(String(data.error)).toMatch(/Could not check the SMTPfast audience/);
+  });
+
   it("rejects a send with no recipients", async () => {
     const { status, data } = await post("/api/send", {
       apiKey: "k",
@@ -244,6 +306,45 @@ describe("studio request guard", () => {
     expect(rejectForeignRequest(fake({ host: "192.168.1.5:4180" }), "0.0.0.0")).toBeUndefined();
     const crossSite = fake({ host: "192.168.1.5:4180", origin: "https://evil.example", "content-type": "application/json" }, "POST");
     expect(rejectForeignRequest(crossSite, "0.0.0.0")).toMatch(/Cross-origin/);
+  });
+});
+
+describe("studio send guard", () => {
+  type Guard = {
+    press(action: string, token: string): "armed" | "confirmed" | "busy";
+    disarm(): boolean;
+    isArmed(action: string): boolean;
+    start(action: string): boolean;
+    finish(): void;
+    busy(): string | null;
+  };
+  const createSendGuard = new Function(`${SEND_GUARD_SOURCE}\nreturn createSendGuard;`)() as () => Guard;
+
+  it("needs two presses for the same audience", () => {
+    const guard = createSendGuard();
+    expect(guard.press("broadcast", "contacts:1")).toBe("armed");
+    expect(guard.press("broadcast", "contacts:1")).toBe("confirmed");
+  });
+
+  it("re-arms instead of sending when the audience changed during confirmation", () => {
+    const guard = createSendGuard();
+    expect(guard.press("broadcast", "contacts:1")).toBe("armed");
+    // The page bumps the audience token and disarms when the key or segment changes.
+    expect(guard.press("broadcast", "contacts:2")).toBe("armed");
+    expect(guard.disarm()).toBe(true);
+    expect(guard.press("broadcast", "contacts:2")).toBe("armed");
+  });
+
+  it("refuses a second send while one is in flight", () => {
+    const guard = createSendGuard();
+    guard.press("list", "list:a@x.com");
+    expect(guard.press("list", "list:a@x.com")).toBe("confirmed");
+    expect(guard.start("list")).toBe(true);
+    expect(guard.start("list")).toBe(false);
+    expect(guard.press("broadcast", "contacts:1")).toBe("busy");
+    expect(guard.busy()).toBe("list");
+    guard.finish();
+    expect(guard.start("broadcast")).toBe(true);
   });
 });
 

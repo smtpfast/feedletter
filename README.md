@@ -137,8 +137,9 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
 | `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
 | `--test` | off | Send only to the first recipient and do not record history. |
-| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items. |
-| `--no-history` | history enabled | Do not record sent items in history. |
+| `--resend` | off | Send to every recipient, even ones an earlier run of this exact issue reached. |
+| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items and send progress. |
+| `--no-history` | history enabled | Do not record sent items or send progress. |
 
 ### `feedletter broadcast`
 
@@ -150,10 +151,11 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--name <name>` | the subject | Broadcast name shown in SMTPfast. |
 | `--footer <text>` | issue footer | Footer note displayed above the unsubscribe link. |
 | `--send` | off | Send now. Without it, Feedletter creates a draft to review and send in SMTPfast. |
+| `--resend` | off | Create a new broadcast even if this exact issue was already broadcast. |
 | `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
 | `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
-| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items. |
-| `--no-history` | history enabled | Do not record sent items in history. |
+| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items and the broadcast id. |
+| `--no-history` | history enabled | Do not record sent items or the broadcast id. |
 
 ## Studio
 
@@ -195,7 +197,10 @@ In the studio you can:
     nobody sees the list. The panel counts the list as you type, removes
     duplicates, and flags addresses SMTPfast would reject.
 - every send asks for a second click that states the count, so nothing goes
-  out by accident
+  out by accident. Changing the API key, the segment, or the list cancels a
+  pending click, and only one send runs at a time
+- sending the same email again skips the people it already reached, and the
+  same broadcast is never created or sent twice
 
 You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
 or `?dir=./content/blog&base=https://example.com`.
@@ -250,12 +255,24 @@ SMTPFAST_API_KEY=sf_... feedletter broadcast --dir dist/newsletter \
 A broadcast reaches subscribed contacts only: SMTPfast skips unsubscribed and
 suppressed addresses and tracks opens and clicks. Each plan includes a number of
 broadcasts a month, and `broadcast --send` checks that before it creates
-anything.
+anything. Checking the audience needs an API key with the `email:read` scope.
 
 `send` skips addresses that are not valid and reports addresses SMTPfast
 suppressed (unsubscribed, bounced, or complained before) as skipped, not
 failed, so a scheduled job does not fail when a subscriber leaves. A 429 rate
-limit is retried after `Retry-After`.
+limit is retried after `Retry-After`, up to three times.
+
+Reruns are safe:
+
+- `send` records each batch SMTPfast accepts in the history file. If a later
+  batch fails, run the same command again: it skips the addresses that already
+  got this exact issue and sends to the rest. Change the issue, or pass
+  `--resend`, to send to everyone again. The batch API has no idempotency key,
+  so with `--no-history` a rerun sends to everyone.
+- `broadcast` records the id of the broadcast it creates. A rerun reuses that
+  draft, and if SMTPfast shows the broadcast as already sent, it stops instead
+  of creating a second one. If the answer to a send is lost, Feedletter reads
+  the broadcast's status before it reports a failure.
 
 ## History Tracking
 
