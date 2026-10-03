@@ -24,6 +24,8 @@ agent command such as Claude Code, Codex, or your own script.
 - RSS/Atom and Markdown/MDX ingestion
 - polished email-safe HTML and plain-text output
 - per-recipient unsubscribe links via SMTPfast (`{{unsubscribe_url}}`)
+- send to your SMTPfast contacts or one segment as a broadcast, or to a list of
+  addresses through the batch API (100 per request)
 - SQLite history tracking so the same post is not included twice
 - custom editorial instructions from a Markdown file
 - OpenAI-compatible enrichment
@@ -138,6 +140,21 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items. |
 | `--no-history` | history enabled | Do not record sent items in history. |
 
+### `feedletter broadcast`
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--from <email>` | required | Verified sender, for example `Weekly <news@yourdomain.com>`. |
+| `--dir <dir>` | `dist/feedletter` | Build output directory containing `issue.json`. |
+| `--segment <id-or-name>` | all contacts | Send to one SMTPfast segment instead of all contacts. |
+| `--name <name>` | the subject | Broadcast name shown in SMTPfast. |
+| `--footer <text>` | issue footer | Footer note displayed above the unsubscribe link. |
+| `--send` | off | Send now. Without it, Feedletter creates a draft to review and send in SMTPfast. |
+| `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
+| `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
+| `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items. |
+| `--no-history` | history enabled | Do not record sent items in history. |
+
 ## Studio
 
 The studio is the fastest way to go from a feed to a sent issue. Start it and
@@ -168,11 +185,17 @@ In the studio you can:
 - set a **From name** and pull each post's **cover image** into the email
 - **save a draft** to JSON and open it later to pick up where you left off
 - send with **SMTPfast**: paste an API key and a verified sender, and Feedletter
-  checks the sender domain is verified, lets you send a test to yourself first,
-  then sends one message per recipient so nobody sees the list, each with its
-  own unsubscribe link
-- for a large audience, hand the email off to a **SMTPfast broadcast** with one
-  click instead of sending one at a time
+  checks the sender domain is verified and lets you send a test to yourself
+  first. Then pick where it goes:
+  - **SMTPfast contacts**: all contacts or one segment, as a broadcast. The
+    panel shows how many contacts it reaches and how many broadcasts your plan
+    has left this month. **Save as draft** puts it in SMTPfast to review and
+    send there; **Send** sends it now.
+  - **A list of addresses**: one message per recipient in batches of 100, so
+    nobody sees the list. The panel counts the list as you type, removes
+    duplicates, and flags addresses SMTPfast would reject.
+- every send asks for a second click that states the count, so nothing goes
+  out by accident
 
 You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
 or `?dir=./content/blog&base=https://example.com`.
@@ -210,8 +233,29 @@ Sending is powered by [SMTPfast](https://smtpfa.st). It handles verified sending
 domains, per-recipient unsubscribe, and deliverability, which is the part
 Feedletter deliberately does not try to reinvent. Create a free account and an
 API key in the dashboard, verify a sending domain, and paste the key into the
-studio's send panel. For large audiences, use SMTPfast broadcasts and contacts
-instead of a one-off recipient list.
+studio's send panel.
+
+From the command line, `feedletter send` sends to a recipient list and
+`feedletter broadcast` sends to your SMTPfast contacts:
+
+```bash
+# Create a draft broadcast for all contacts, then review and send it in SMTPfast
+SMTPFAST_API_KEY=sf_... feedletter broadcast --dir dist/newsletter --from "Weekly <news@yourdomain.com>"
+
+# Send now to one segment (by name or id)
+SMTPFAST_API_KEY=sf_... feedletter broadcast --dir dist/newsletter \
+  --from "Weekly <news@yourdomain.com>" --segment "Newsletter" --send
+```
+
+A broadcast reaches subscribed contacts only: SMTPfast skips unsubscribed and
+suppressed addresses and tracks opens and clicks. Each plan includes a number of
+broadcasts a month, and `broadcast --send` checks that before it creates
+anything.
+
+`send` skips addresses that are not valid and reports addresses SMTPfast
+suppressed (unsubscribed, bounced, or complained before) as skipped, not
+failed, so a scheduled job does not fail when a subscriber leaves. A 429 rate
+limit is retried after `Retry-After`.
 
 ## History Tracking
 

@@ -5,7 +5,18 @@ import { loadContentDirectory } from "./content.js";
 import { HistoryStore, itemHistoryKey } from "./history.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
-import { parseRecipients, sendDigest, verifyFromDomain, SMTPFAST_DEFAULT_BASE_URL, SMTPFAST_SIGNUP_URL, UNSUBSCRIBE_PLACEHOLDER } from "./smtpfast.js";
+import {
+  checkRecipients,
+  createBroadcast,
+  getAudience,
+  parseRecipients,
+  sendBroadcast,
+  sendDigest,
+  verifyFromDomain,
+  SMTPFAST_DEFAULT_BASE_URL,
+  SMTPFAST_SIGNUP_URL,
+  UNSUBSCRIBE_PLACEHOLDER,
+} from "./smtpfast.js";
 import { renderStudioPage } from "./studio-ui.js";
 import type { DigestIssue, SourceItem } from "./types.js";
 import { enrichIssueWithCommand } from "./writer.js";
@@ -219,49 +230,137 @@ async function handleEnrich(req: IncomingMessage, res: ServerResponse, ctx: Serv
   });
 }
 
+/** Record a real send so the same items are not sent twice. Best-effort: never fail a send over it. */
+async function recordSent(ctx: ServerContext, subject: string, items: SourceItem[], sourceLabel: string) {
+  if (!ctx.historyStore || items.length === 0) return;
+  try {
+    await ctx.historyStore.recordIssue({
+      title: subject,
+      preheader: "",
+      intro: "",
+      items,
+      generatedAt: new Date().toISOString(),
+      sourceLabel,
+    });
+  } catch {
+    /* history is best-effort */
+  }
+}
+
+function smtpfastConfig(body: Record<string, unknown>) {
+  return {
+    apiKey: toStringField(body.apiKey).trim(),
+    baseUrl: toStringField(body.baseUrl).trim() || SMTPFAST_DEFAULT_BASE_URL,
+  };
+}
+
+/** Render the email on the server from the studio draft, always with a per-recipient unsubscribe link. */
+function renderSendable(body: Record<string, unknown>) {
+  const draft = body.draft && typeof body.draft === "object" ? (body.draft as Record<string, unknown>) : undefined;
+  if (!draft) {
+    return {
+      subject: toStringField(body.subject).trim(),
+      html: toStringField(body.html),
+      text: toStringField(body.text),
+      items: normalizeItems(body.items),
+      sourceLabel: toStringField(body.sourceLabel, "Digest"),
+      preheader: "",
+    };
+  }
+  const issue = issueFromDraft({ ...draft, includeUnsubscribe: true, unsubscribeUrl: UNSUBSCRIBE_PLACEHOLDER });
+  return {
+    subject: toStringField(draft.title).trim(),
+    html: issue.items.length > 0 ? renderHtml(issue) : "",
+    text: issue.items.length > 0 ? renderText(issue) : "",
+    items: issue.items,
+    sourceLabel: issue.sourceLabel,
+    preheader: issue.preheader,
+  };
+}
+
 async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
   const body = await readJson<Record<string, unknown>>(req);
-  const apiKey = toStringField(body.apiKey).trim();
+  const config = smtpfastConfig(body);
   const from = toStringField(body.from).trim();
-  const subject = toStringField(body.subject).trim();
   const recipients = parseRecipients(toStringField(body.recipients));
-  const html = toStringField(body.html);
-  const text = toStringField(body.text);
-  const baseUrl = toStringField(body.baseUrl).trim() || SMTPFAST_DEFAULT_BASE_URL;
   const isTest = body.test === true;
+  const email = renderSendable(body);
 
-  if (!apiKey) return sendJson(res, 400, { error: "Paste your SMTPfast API key." });
+  if (!config.apiKey) return sendJson(res, 400, { error: "Paste your SMTPfast API key." });
   if (!from) return sendJson(res, 400, { error: "Enter a verified sender address." });
-  if (!subject) return sendJson(res, 400, { error: "Add a subject line." });
+  if (!email.subject) return sendJson(res, 400, { error: "Add a subject line." });
   if (recipients.length === 0) {
     return sendJson(res, 400, { error: isTest ? "Enter a test address." : "Add at least one recipient." });
   }
-  if (!html) return sendJson(res, 400, { error: "Nothing to send yet. Load a source first." });
-
-  const results = await sendDigest({ apiKey, baseUrl }, { from, subject, html, text }, recipients);
-  const sent = results.filter((r) => r.ok).length;
-
-  // Record a real send in history so the same items are not sent twice. Test
-  // sends never touch history.
-  if (!isTest && sent > 0 && ctx.historyStore) {
-    const items = normalizeItems(body.items);
-    if (items.length > 0) {
-      try {
-        await ctx.historyStore.recordIssue({
-          title: subject,
-          preheader: "",
-          intro: "",
-          items,
-          generatedAt: new Date().toISOString(),
-          sourceLabel: toStringField(body.sourceLabel, "Digest"),
-        });
-      } catch {
-        /* history is best-effort; never fail a send over it */
-      }
-    }
+  if (!email.html) return sendJson(res, 400, { error: "Nothing to send yet. Load a source and tick at least one item." });
+  const checked = checkRecipients(recipients);
+  if (checked.valid.length === 0) {
+    return sendJson(res, 400, { error: `No valid addresses to send to: ${checked.invalid.slice(0, 5).join(", ")}` });
   }
 
-  return sendJson(res, 200, { sent, failed: results.length - sent, results });
+  const results = await sendDigest(config, { from, subject: email.subject, html: email.html, text: email.text }, checked.valid, {
+    idempotent: !isTest,
+  });
+  for (const recipient of checked.invalid) results.push({ recipient, ok: false, error: "not a valid email address" });
+  const sent = results.filter((r) => r.ok).length;
+  const skipped = results.filter((r) => r.suppressed).length;
+
+  // Test sends never touch history.
+  if (!isTest && sent > 0) await recordSent(ctx, email.subject, email.items, email.sourceLabel);
+
+  return sendJson(res, 200, { sent, skipped, failed: results.length - sent - skipped, results });
+}
+
+async function handleAudience(req: IncomingMessage, res: ServerResponse) {
+  const body = await readJson<Record<string, unknown>>(req);
+  const config = smtpfastConfig(body);
+  if (!config.apiKey) return sendJson(res, 400, { error: "Paste your SMTPfast API key." });
+  const segmentId = toStringField(body.segmentId).trim() || undefined;
+  try {
+    return sendJson(res, 200, await getAudience(config, segmentId));
+  } catch (error) {
+    return sendJson(res, 502, { error: error instanceof Error ? error.message : String(error) });
+  }
+}
+
+async function handleBroadcast(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
+  const body = await readJson<Record<string, unknown>>(req);
+  const config = smtpfastConfig(body);
+  const from = toStringField(body.from).trim();
+  const segmentId = toStringField(body.segmentId).trim() || undefined;
+  const sendNow = body.send === true;
+  const email = renderSendable(body);
+
+  if (!config.apiKey) return sendJson(res, 400, { error: "Paste your SMTPfast API key." });
+  if (!from) return sendJson(res, 400, { error: "Enter a verified sender address." });
+  if (!email.subject) return sendJson(res, 400, { error: "Add a subject line." });
+  if (!email.html) return sendJson(res, 400, { error: "Nothing to send yet. Load a source and tick at least one item." });
+
+  try {
+    const draft = await createBroadcast(config, {
+      name: toStringField(body.name).trim() || email.subject,
+      from,
+      subject: email.subject,
+      previewText: email.preheader,
+      html: email.html,
+      text: email.text,
+      segmentId,
+    });
+    if (!sendNow) return sendJson(res, 200, draft);
+    try {
+      const sent = await sendBroadcast(config, draft.id);
+      await recordSent(ctx, email.subject, email.items, email.sourceLabel);
+      return sendJson(res, 200, sent);
+    } catch (error) {
+      // The draft exists; point the user at it rather than leaving an orphan they cannot see.
+      return sendJson(res, 502, {
+        error: `${error instanceof Error ? error.message : String(error)} The draft was saved in SMTPfast.`,
+        url: draft.url,
+      });
+    }
+  } catch (error) {
+    return sendJson(res, 502, { error: error instanceof Error ? error.message : String(error) });
+  }
 }
 
 export async function startStudioServer(options: StudioOptions) {
@@ -315,6 +414,8 @@ export async function startStudioServer(options: StudioOptions) {
       if (req.method === "POST" && url.pathname === "/api/enrich") return void (await handleEnrich(req, res, ctx));
       if (req.method === "POST" && url.pathname === "/api/verify-domain") return void (await handleVerifyDomain(req, res));
       if (req.method === "POST" && url.pathname === "/api/send") return void (await handleSend(req, res, ctx));
+      if (req.method === "POST" && url.pathname === "/api/audience") return void (await handleAudience(req, res));
+      if (req.method === "POST" && url.pathname === "/api/broadcast") return void (await handleBroadcast(req, res, ctx));
 
       sendJson(res, 404, { error: "Not found" });
     } catch (error) {

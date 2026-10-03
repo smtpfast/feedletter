@@ -14,20 +14,34 @@ let contentDir: string;
 
 // A stand-in for the SMTPfast API so the studio's own fetch has something to hit
 // without stubbing global fetch (which the test itself uses to call the studio).
+const received: Array<{ method?: string; url?: string; body: unknown }> = [];
+
 function startMock(): Promise<Server> {
   const server = createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/v1/domains") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify([{ id: "dom_1", domain: "example.com", status: "verified" }]));
-      return;
-    }
-    if (req.method === "POST" && req.url === "/v1/emails") {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ id: "email_test" }));
-      return;
-    }
-    res.writeHead(404);
-    res.end("{}");
+    let raw = "";
+    req.on("data", (chunk) => (raw += chunk));
+    req.on("end", () => {
+      const body = raw ? JSON.parse(raw) : undefined;
+      received.push({ method: req.method, url: req.url, body });
+      const json = (status: number, payload: unknown) => {
+        res.writeHead(status, { "content-type": "application/json" });
+        res.end(JSON.stringify(payload));
+      };
+      if (req.method === "GET" && req.url === "/v1/domains") return json(200, [{ id: "dom_1", domain: "example.com", status: "verified" }]);
+      if (req.method === "POST" && req.url === "/v1/emails/batch") {
+        return json(200, { batch_id: "b1", emails: (body as unknown[]).map((_, i) => ({ id: `email_${i}`, status: "queued" })) });
+      }
+      if (req.method === "GET" && req.url?.startsWith("/v1/broadcasts/audience")) {
+        return json(200, {
+          audience: { total: 5, eligible: 4, skipped: 1 },
+          segments: [{ id: "seg_1", name: "Customers", contact_count: 2 }],
+          package: { label: "Starter", broadcast_limit: 10, broadcasts_used: 1 },
+        });
+      }
+      if (req.method === "POST" && req.url === "/v1/broadcasts") return json(201, { id: "bc_1", status: "draft" });
+      if (req.method === "POST" && req.url === "/v1/broadcasts/bc_1/send") return json(200, { id: "bc_1", status: "queued", recipients: 4 });
+      json(404, {});
+    });
   });
   return new Promise((resolve) => server.listen(0, "127.0.0.1", () => resolve(server)));
 }
@@ -134,7 +148,7 @@ describe("studio server", () => {
     expect(data.verified).toBe(true);
   });
 
-  it("sends via the SMTPfast endpoint", async () => {
+  it("sends via the SMTPfast batch endpoint", async () => {
     const { status, data } = await post("/api/send", {
       apiKey: "k",
       from: "news@example.com",
@@ -146,6 +160,49 @@ describe("studio server", () => {
     expect(status).toBe(200);
     expect(data.sent).toBe(2);
     expect(data.failed).toBe(0);
+  });
+
+  const draft = { title: "Weekly", preheader: "Two posts", items: [{ title: "One", url: "https://example.com/1" }] };
+
+  it("renders a draft on the server with the unsubscribe placeholder and skips invalid addresses", async () => {
+    received.length = 0;
+    const { status, data } = await post("/api/send", {
+      apiKey: "k",
+      from: '"The Weekly" <news@example.com>',
+      recipients: "a@x.com, not-an-address",
+      draft: { ...draft, unsubscribeUrl: "https://evil.example/u" },
+      baseUrl: mockUrl,
+    });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ sent: 1, failed: 1 });
+    const rows = received.find((r) => r.url === "/v1/emails/batch")!.body as Array<{ to: string[]; subject: string; html: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ to: ["a@x.com"], subject: "Weekly" });
+    expect(rows[0].html).toContain("{{unsubscribe_url}}");
+    expect(rows[0].html).not.toContain("evil.example");
+  });
+
+  it("returns the SMTPfast audience", async () => {
+    const { status, data } = await post("/api/audience", { apiKey: "k", baseUrl: mockUrl });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ eligible: 4, broadcastLimit: 10, broadcastsUsed: 1 });
+  });
+
+  it("creates a broadcast draft without sending it", async () => {
+    received.length = 0;
+    const { status, data } = await post("/api/broadcast", { apiKey: "k", from: "news@example.com", segmentId: "seg_1", draft, baseUrl: mockUrl });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ id: "bc_1", status: "draft", url: "https://smtpfa.st/broadcasts/bc_1" });
+    const created = received.find((r) => r.url === "/v1/broadcasts")!.body as Record<string, unknown>;
+    expect(created).toMatchObject({ subject: "Weekly", preview_text: "Two posts", audience: "segment", segment_id: "seg_1" });
+    expect(String(created.html)).toContain("{{unsubscribe_url}}");
+    expect(received.some((r) => r.url?.endsWith("/send"))).toBe(false);
+  });
+
+  it("creates and sends a broadcast", async () => {
+    const { status, data } = await post("/api/broadcast", { apiKey: "k", from: "news@example.com", send: true, draft, baseUrl: mockUrl });
+    expect(status).toBe(200);
+    expect(data).toMatchObject({ status: "queued", recipients: 4 });
   });
 
   it("rejects a send with no recipients", async () => {
