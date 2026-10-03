@@ -175,11 +175,17 @@ describe("studio request guard", () => {
   });
 
   it("applies the Host check to every bind that resolves to loopback, and fails closed", async () => {
-    for (const bind of ["LOCALHOST", "127.0.0.2", "127.1", "::1", "0:0:0:0:0:0:0:1", "no-such-host.invalid"]) {
-      expect(await bindNeedsHostGuard(bind), bind).toBe(true);
+    // A fixed resolver keeps the test offline; dns.lookup("127.1") gives 127.0.0.1 on Node.
+    const resolver = (table: Record<string, string[]>) => async (host: string) => {
+      if (table[host]) return table[host].map((address) => ({ address }));
+      throw Object.assign(new Error(`getaddrinfo ENOTFOUND ${host}`), { code: "ENOTFOUND" });
+    };
+    const dns = resolver({ "127.1": ["127.0.0.1"], "studio.lan": ["192.168.1.5"], "both.lan": ["192.168.1.5", "::1"] });
+    for (const bind of ["LOCALHOST", "127.0.0.2", "::1", "0:0:0:0:0:0:0:1", "127.1", "both.lan", "no-such-host.invalid"]) {
+      expect(await bindNeedsHostGuard(bind, dns), bind).toBe(true);
     }
-    for (const bind of ["0.0.0.0", "::", "192.168.1.5"]) {
-      expect(await bindNeedsHostGuard(bind), bind).toBe(false);
+    for (const bind of ["0.0.0.0", "::", "192.168.1.5", "studio.lan"]) {
+      expect(await bindNeedsHostGuard(bind, dns), bind).toBe(false);
     }
   });
 
