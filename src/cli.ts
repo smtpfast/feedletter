@@ -15,7 +15,7 @@ import {
   UNSUBSCRIBE_PLACEHOLDER,
 } from "./smtpfast.js";
 import { startStudioServer } from "./studio.js";
-import { requireOneSource, writeOutputFile } from "./utils.js";
+import { hostLabel, requireOneSource, writeOutputFile } from "./utils.js";
 import { enrichIssueWithCommand } from "./writer.js";
 import type { DigestIssue } from "./types.js";
 
@@ -67,7 +67,13 @@ program
             limit: loadLimit,
           });
 
-      if (loadedItems.length === 0) throw new Error("No items found.");
+      if (loadedItems.length === 0) {
+        throw new Error(
+          options.rss
+            ? `The feed at ${options.rss} has no items yet.`
+            : `No .md or .mdx files found in ${path.resolve(options.content)}.`,
+        );
+      }
 
       let skippedSeenCount = 0;
       let freshItems = loadedItems;
@@ -94,7 +100,7 @@ program
           : undefined;
 
       const sourceLabel =
-        options.sourceLabel ?? (options.rss ? new URL(options.rss).hostname : "Local content");
+        options.sourceLabel ?? (options.rss ? hostLabel(items[0]?.source ?? options.rss, "Feed") : "Local content");
       const fallback = buildFallbackIssue(
         options.title,
         options.description,

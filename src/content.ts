@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import path from "node:path";
 import fg from "fast-glob";
 import matter from "gray-matter";
@@ -21,12 +21,30 @@ function frontmatterString(data: Record<string, unknown>, keys: string[]) {
   for (const key of keys) {
     const value = data[key];
     if (typeof value === "string" && value.trim()) return value.trim();
-    if (value instanceof Date) return value.toISOString();
+    if (value instanceof Date && !Number.isNaN(value.getTime())) {
+      // YAML turns `date: 2026-05-30` into midnight UTC. Keep it a plain date so
+      // it does not render as the day before in time zones west of UTC.
+      const iso = value.toISOString();
+      return iso.endsWith("T00:00:00.000Z") ? iso.slice(0, 10) : iso;
+    }
   }
   return undefined;
 }
 
+async function assertDirectory(dir: string) {
+  try {
+    const info = await stat(dir);
+    if (!info.isDirectory()) throw new Error(`${dir} is a file, not a directory. Point --content at the folder that holds your Markdown posts.`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(`Content directory not found: ${dir}. Check the path; it is resolved from where you ran feedletter.`);
+    }
+    throw error;
+  }
+}
+
 export async function loadContentDirectory(options: LoadContentOptions): Promise<SourceItem[]> {
+  await assertDirectory(options.dir);
   const files = await fg(["**/*.md", "**/*.mdx"], {
     cwd: options.dir,
     absolute: true,

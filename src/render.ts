@@ -13,12 +13,19 @@ function formatDate(value?: string) {
   if (!value) return "";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
+  // A date with no time (2026-05-30, or midnight UTC from YAML) is a calendar
+  // day. Format it in UTC so it is not shown as the day before west of UTC.
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(value.trim()) || /T00:00(:00(\.0+)?)?(Z|[+-]00:?00)$/.test(value.trim());
   return new Intl.DateTimeFormat("en", {
     year: "numeric",
     month: "short",
     day: "numeric",
+    ...(dateOnly ? { timeZone: "UTC" } : {}),
   }).format(date);
 }
+
+// Padding after the preheader so inbox previews do not run on into the body text.
+const PREHEADER_PADDING = "&#847;&zwnj;&nbsp;".repeat(60);
 
 function readingHost(item: SourceItem) {
   if (!item.url) return "";
@@ -40,22 +47,23 @@ function renderItem(item: SourceItem) {
     : title;
   const image = item.image && /^https?:\/\//i.test(item.image) ? escapeHtml(item.image) : "";
   const imageHtml = image
-    ? `<a href="${item.url ? escapeHtml(item.url) : "#"}" style="text-decoration:none;"><img src="${image}" alt="" width="600" style="display:block;width:100%;height:auto;border-radius:16px 16px 0 0;" /></a>`
+    ? `<img src="${image}" alt="" width="678" border="0" style="display:block;width:100%;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;border-radius:16px 16px 0 0;" />`
     : "";
+  const linkedImage = imageHtml && item.url ? `<a href="${escapeHtml(item.url)}" style="text-decoration:none;">${imageHtml}</a>` : imageHtml;
 
   return `
     <tr>
       <td style="padding:0 0 14px;">
-        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border:1px solid #e5e7eb;border-radius:16px;background:#ffffff;overflow:hidden;">
-          ${imageHtml ? `<tr><td style="padding:0;">${imageHtml}</td></tr>` : ""}
+        <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#ffffff" style="border:1px solid #e5e7eb;border-radius:16px;background:#ffffff;overflow:hidden;">
+          ${linkedImage ? `<tr><td style="padding:0;">${linkedImage}</td></tr>` : ""}
           <tr>
-            <td style="padding:20px 20px 18px;">
+            <td class="fl-card" style="padding:20px 20px 18px;">
               ${meta ? `<div style="margin-bottom:10px;font-size:12px;line-height:18px;color:#64748b;">${escapeHtml(meta)}</div>` : ""}
-              <h2 style="margin:0 0 9px;font-size:20px;line-height:28px;color:#111827;font-weight:800;">${titleHtml}</h2>
+              <h2 style="margin:0 0 9px;font-size:20px;line-height:28px;color:#111827;font-weight:800;overflow-wrap:break-word;word-wrap:break-word;">${titleHtml}</h2>
               ${summary ? `<p style="margin:0 0 16px;font-size:15px;line-height:24px;color:#475569;">${summary}</p>` : ""}
               ${
                 item.url
-                  ? `<table role="presentation" cellspacing="0" cellpadding="0"><tr><td style="border-radius:999px;background:#059669;"><a href="${escapeHtml(item.url)}" style="display:inline-block;padding:9px 14px;font-size:13px;line-height:18px;color:#ffffff;font-weight:700;text-decoration:none;">Read the post</a></td></tr></table>`
+                  ? `<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td bgcolor="#059669" style="border-radius:999px;background:#059669;mso-padding-alt:9px 14px;"><a href="${escapeHtml(item.url)}" style="display:inline-block;padding:9px 14px;font-size:13px;line-height:18px;color:#ffffff;font-weight:700;text-decoration:none;">Read the post</a></td></tr></table>`
                   : ""
               }
             </td>
@@ -89,31 +97,44 @@ export function renderHtml(issue: DigestIssue) {
   const footer = footerBits.join("");
 
   return `<!doctype html>
-<html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:v="urn:schemas-microsoft-com:vml" xmlns:o="urn:schemas-microsoft-com:office:office">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta http-equiv="X-UA-Compatible" content="IE=edge">
+    <meta name="x-apple-disable-message-reformatting">
+    <meta name="format-detection" content="telephone=no,date=no,address=no,email=no">
     <title>${title}</title>
+    <!--[if mso]><noscript><xml><o:OfficeDocumentSettings><o:PixelsPerInch>96</o:PixelsPerInch></o:OfficeDocumentSettings></xml></noscript><![endif]-->
+    <style>
+      @media only screen and (max-width:480px) {
+        .fl-outer { padding:16px 8px !important; }
+        .fl-hero { padding:26px 20px 22px !important; }
+        .fl-h1 { font-size:27px !important; line-height:34px !important; }
+        .fl-card { padding:18px 16px 16px !important; }
+      }
+    </style>
   </head>
-  <body style="margin:0;padding:0;background:#eef2f7;font-family:Arial,Helvetica,sans-serif;">
-    <div style="display:none;max-height:0;overflow:hidden;opacity:0;color:transparent;">${preheader}</div>
-    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="background:#eef2f7;">
+  <body style="margin:0;padding:0;background:#eef2f7;font-family:Arial,Helvetica,sans-serif;-webkit-text-size-adjust:100%;-ms-text-size-adjust:100%;">
+    ${preheader ? `<div style="display:none;font-size:1px;line-height:1px;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">${preheader}${PREHEADER_PADDING}</div>` : ""}
+    <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#eef2f7" style="background:#eef2f7;">
       <tr>
-        <td align="center" style="padding:28px 14px;">
-          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="max-width:680px;">
+        <td align="center" class="fl-outer" style="padding:28px 14px;">
+          <!--[if mso]><table role="presentation" width="680" align="center" cellspacing="0" cellpadding="0" border="0"><tr><td><![endif]-->
+          <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" style="max-width:680px;">
             <tr>
               <td style="padding:0 0 14px;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="overflow:hidden;border-radius:22px;background:#0b0b0c;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#0b0b0c" style="overflow:hidden;border-radius:22px;background:#0b0b0c;">
                   <tr>
-                    <td style="padding:8px;background:#10b981;"></td>
+                    <td height="16" bgcolor="#10b981" style="height:16px;padding:0;background:#10b981;font-size:0;line-height:0;">&nbsp;</td>
                   </tr>
                   <tr>
-                    <td style="padding:34px 30px 30px;">
+                    <td class="fl-hero" style="padding:34px 30px 30px;">
                       <div style="margin-bottom:18px;">
                         <span style="display:inline-block;border:1px solid rgba(255,255,255,.18);border-radius:999px;padding:7px 10px;font-size:12px;line-height:16px;color:#d1fae5;font-weight:700;">${escapeHtml(issue.sourceLabel)}</span>
                         <span style="display:inline-block;margin-left:8px;border:1px solid rgba(255,255,255,.14);border-radius:999px;padding:7px 10px;font-size:12px;line-height:16px;color:#cbd5e1;">${escapeHtml(itemCount)}</span>
                       </div>
-                      <h1 style="margin:0 0 14px;font-size:34px;line-height:42px;color:#ffffff;font-weight:800;">${title}</h1>
+                      <h1 class="fl-h1" style="margin:0 0 14px;font-size:34px;line-height:42px;color:#ffffff;font-weight:800;overflow-wrap:break-word;word-wrap:break-word;">${title}</h1>
                       <p style="margin:0;font-size:16px;line-height:26px;color:#cbd5e1;">${intro}</p>
                     </td>
                   </tr>
@@ -122,14 +143,14 @@ export function renderHtml(issue: DigestIssue) {
             </tr>
             <tr>
               <td style="padding:0;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0">
                   ${issue.items.map(renderItem).join("")}
                 </table>
               </td>
             </tr>
             <tr>
               <td style="padding:4px 2px 0;">
-                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" style="border-radius:16px;background:#f8fafc;border:1px solid #e2e8f0;">
+                <table role="presentation" width="100%" cellspacing="0" cellpadding="0" border="0" bgcolor="#f8fafc" style="border-radius:16px;background:#f8fafc;border:1px solid #e2e8f0;">
                   <tr>
                     <td style="padding:18px 20px;">
                       ${footer}
@@ -139,6 +160,7 @@ export function renderHtml(issue: DigestIssue) {
               </td>
             </tr>
           </table>
+          <!--[if mso]></td></tr></table><![endif]-->
         </td>
       </tr>
     </table>
