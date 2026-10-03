@@ -395,11 +395,13 @@ iframe{width:100%;height:100%;border:0;display:block;background:#e9edf2}
 @media (prefers-reduced-motion:reduce){*{animation:none !important}}
 @media (max-width:1080px){.grid{grid-template-columns:minmax(0,1fr);height:auto}.col{height:auto}.preview-body{height:70vh}.item-list{max-height:none}}
 @media (max-width:640px){
-  .topbar{padding:10px 14px;gap:10px}
+  .topbar{padding:10px 14px;gap:10px;backdrop-filter:none;background:rgba(5,5,5,.96)}
   .brand .tag{display:none}
   .brand .logo{width:30px;height:30px;font-size:16px}
   .top-actions{gap:8px;min-width:0}
   .top-actions .status{display:none}
+  /* Errors stay visible on phones: a bar at the bottom of the screen; tap to dismiss. */
+  .top-actions .status.err{display:block;position:fixed;left:10px;right:10px;bottom:10px;z-index:30;max-width:none;white-space:normal;padding:10px 12px;font-size:12px;line-height:1.45;border-radius:10px;background:#1c0d0d;cursor:pointer}
   #openSend{padding:8px 12px;font-size:13px;white-space:nowrap}
   .grid{padding:10px;gap:10px}
   .drawer{width:100vw;padding:16px}
@@ -420,6 +422,7 @@ function setStatus(msg, kind){
   pill.hidden = false; pill.textContent = msg; pill.title = msg;
   pill.className = "status" + (kind ? " "+kind : "");
 }
+$("statusPill").addEventListener("click", ()=>{ $("statusPill").hidden = true; });
 
 // ---- source toggle ----
 $("segRss").onclick = () => switchSource("rss");
@@ -533,10 +536,11 @@ function itemCard(item, index){
   return el;
 }
 // Date-only values (2026-05-30) are calendar days: show them in UTC so they do not slip a day.
+// Real timestamps, midnight included, are shown in the viewer's time zone.
 function formatDay(value){
   const d = new Date(value);
   if(isNaN(d.getTime())) return "";
-  const dateOnly = /^\\d{4}-\\d{2}-\\d{2}$/.test(String(value).trim()) || /T00:00(:00(\\.0+)?)?(Z|[+-]00:?00)$/.test(String(value).trim());
+  const dateOnly = /^\\d{4}-\\d{2}-\\d{2}$/.test(String(value).trim());
   return d.toLocaleDateString("en", dateOnly ? {month:"short",day:"numeric",timeZone:"UTC"} : {month:"short",day:"numeric"});
 }
 function hostOf(url){ try{ return new URL(url).hostname.replace(/^www\\./,""); }catch{ return ""; } }

@@ -1,10 +1,10 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer, request, type Server } from "node:http";
+import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
-import { startStudioServer } from "./studio.js";
+import { isLoopbackHost, rejectForeignRequest, startStudioServer } from "./studio.js";
 
 let studio: Server;
 let mock: Server;
@@ -218,3 +218,32 @@ describe("studio server", () => {
     expect(data.error).toBeTruthy();
   });
 });
+
+describe("studio request guard", () => {
+  const fake = (headers: Record<string, string>, method = "GET") => ({ headers, method }) as unknown as IncomingMessage;
+
+  it("recognises loopback binds in any case and spelling", () => {
+    for (const host of ["127.0.0.1", "127.0.0.2", "127.255.0.9", "localhost", "LOCALHOST", "LocalHost", "::1", "[::1]", "0:0:0:0:0:0:0:1", "::ffff:127.0.0.1"]) {
+      expect(isLoopbackHost(host), host).toBe(true);
+    }
+    for (const host of ["0.0.0.0", "::", "192.168.1.5", "128.0.0.1", "localhost.evil.example", "evil.example"]) {
+      expect(isLoopbackHost(host), host).toBe(false);
+    }
+  });
+
+  it("enforces the Host check for every loopback bind", () => {
+    for (const bind of ["LOCALHOST", "127.0.0.2", "::1", "0:0:0:0:0:0:0:1"]) {
+      expect(rejectForeignRequest(fake({ host: "attacker.example:4180" }), bind), bind).toBe("Unknown host.");
+    }
+    expect(rejectForeignRequest(fake({ host: "127.0.0.2:4180" }), "127.0.0.2")).toBeUndefined();
+    expect(rejectForeignRequest(fake({ host: "LOCALHOST:4180" }), "127.0.0.1")).toBeUndefined();
+    expect(rejectForeignRequest(fake({ host: "[::1]:4180" }), "::1")).toBeUndefined();
+  });
+
+  it("accepts any Host on an explicit non-loopback bind but still checks Origin", () => {
+    expect(rejectForeignRequest(fake({ host: "192.168.1.5:4180" }), "0.0.0.0")).toBeUndefined();
+    const crossSite = fake({ host: "192.168.1.5:4180", origin: "https://evil.example", "content-type": "application/json" }, "POST");
+    expect(rejectForeignRequest(crossSite, "0.0.0.0")).toMatch(/Cross-origin/);
+  });
+});
+
