@@ -1,4 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
@@ -31,6 +33,82 @@ interface ServerContext extends StudioOptions {
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
+/** Lowercase a host and strip IPv6 brackets: "[::1]" and "::1" compare equal. */
+function normalizeHost(host: string) {
+  return host.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1");
+}
+
+/** The hostname part of a Host header, without the port. */
+function hostnameOf(hostHeader: string | undefined) {
+  if (!hostHeader) return "";
+  const value = hostHeader.trim();
+  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(value);
+  return normalizeHost(bracketed ? bracketed[1] : value.replace(/:\d+$/, ""));
+}
+
+function isIpv6Loopback(address: string) {
+  if (/^::ffff:127\./.test(address)) return true;
+  const [head, tail] = address.includes("::") ? address.split("::") : [address, undefined];
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(8 - left.length - right.length, 0)).fill("0"), ...right];
+  return groups.length === 8 && groups.slice(0, 7).every((group) => /^0+$/.test(group)) && /^0*1$/.test(groups[7]);
+}
+
+/** localhost (any case), any 127.0.0.0/8 address, or ::1 in any spelling. */
+export function isLoopbackHost(host: string) {
+  const h = normalizeHost(host);
+  if (h === "localhost" || h.endsWith(".localhost")) return true;
+  if (isIP(h) === 4) return h.startsWith("127.");
+  if (isIP(h) === 6) return isIpv6Loopback(h);
+  return false;
+}
+
+/**
+ * Whether the Host check applies: the bind address resolves to a loopback
+ * address (127.1 and 2130706433 do), or it cannot be resolved (fail closed).
+ * Binding to a non-loopback address such as 0.0.0.0 is an explicit opt-in.
+ */
+export async function bindNeedsHostGuard(
+  bindHost: string,
+  resolve: (host: string, options: { all: true }) => Promise<Array<{ address: string }>> = lookup,
+): Promise<boolean> {
+  const host = normalizeHost(bindHost);
+  if (isLoopbackHost(host)) return true;
+  if (isIP(host)) return false;
+  try {
+    const addresses = await resolve(host, { all: true });
+    return addresses.length === 0 || addresses.some((entry) => isLoopbackHost(entry.address));
+  } catch {
+    return true;
+  }
+}
+
+/**
+ * The studio is a local tool that can read local folders, run the writer
+ * command, and send email, so only the studio page itself may call its API.
+ * Returns an error message for a request a web page elsewhere could make.
+ */
+export function rejectForeignRequest(req: IncomingMessage, hostGuard: boolean): string | undefined {
+  const host = hostnameOf(req.headers.host);
+  // On a loopback bind, a Host that is not a loopback name means DNS rebinding.
+  // The Origin and content-type checks below apply to every bind.
+  if (hostGuard && !isLoopbackHost(host)) return "Unknown host.";
+  if (req.method !== "POST") return undefined;
+  const origin = req.headers.origin;
+  if (origin) {
+    let originHost = "";
+    try {
+      originHost = new URL(origin).host.toLowerCase();
+    } catch {
+      return "Cross-origin requests are not allowed.";
+    }
+    if (originHost !== (req.headers.host ?? "").trim().toLowerCase()) return "Cross-origin requests are not allowed.";
+  }
+  // A JSON content type forces a CORS preflight for any cross-site caller.
+  if (!/^application\/json\b/i.test(req.headers["content-type"] ?? "")) return "Send JSON with Content-Type: application/json.";
+  return undefined;
+}
 
 function readJson<T>(req: IncomingMessage): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -264,9 +342,12 @@ export async function startStudioServer(options: StudioOptions) {
     historyEnabled: Boolean(ctx.historyStore),
   });
 
+  const hostGuard = await bindNeedsHostGuard(options.host);
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${options.host}:${options.port}`);
     try {
+      const rejection = rejectForeignRequest(req, hostGuard);
+      if (rejection) return void sendJson(res, 403, { error: rejection });
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(page);

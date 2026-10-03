@@ -168,7 +168,10 @@ In the studio you can:
 - polish the copy with **Improve** (uses your own AI key server-side, or an
   external writer like `claude -p` or `codex` when you start studio with
   `--agent-command`, so you can skip the API entirely)
-- watch a live email and plain-text preview as you go
+- watch a live email and plain-text preview as you go, at desktop or phone
+  width (375px), with an inbox row that shows the sender, subject, and
+  preheader the way a reader sees them, plus length hints for the subject
+  and preheader
 - set a **From name** and pull each post's **cover image** into the email
 - **save a draft** to JSON and open it later to pick up where you left off
 - send with **SMTPfast**: paste an API key and a verified sender, and Feedletter
@@ -180,6 +183,12 @@ In the studio you can:
 
 You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
 or `?dir=./content/blog&base=https://example.com`.
+
+The studio's API only answers the studio page itself: it rejects requests with
+another site's `Origin`, requests that are not JSON, and, when bound to
+`127.0.0.1` (the default), any `Host` header other than a loopback name. If you
+bind it to another interface with `--host`, anyone who can reach that address
+can use it, so keep it on a trusted network.
 
 ## Automation
 

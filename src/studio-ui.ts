@@ -32,6 +32,7 @@ export function renderStudioPage(config: StudioPageConfig): string {
       </div>
       <div class="top-actions">
         <span id="statusPill" class="status" hidden></span>
+        <span id="liveRegion" class="sr-only" role="status" aria-live="polite"></span>
         <button id="openSend" class="btn primary" type="button" disabled>Send with SMTPfast</button>
       </div>
     </header>
@@ -42,16 +43,16 @@ export function renderStudioPage(config: StudioPageConfig): string {
           <span class="source-bar-main"><span class="dot"></span><span id="sourceBarLabel">Source</span></span>
           <span class="source-bar-change">Change</span>
         </button>
-        <div id="sourcePanel" class="panel">
+        <form id="sourcePanel" class="panel" novalidate>
           <h2>1. Source</h2>
-          <div class="seg" role="tablist">
-            <button id="segRss" class="seg-btn active" type="button" role="tab">RSS / Atom</button>
-            <button id="segContent" class="seg-btn" type="button" role="tab">Markdown dir</button>
+          <div class="seg" role="group" aria-label="Source type">
+            <button id="segRss" class="seg-btn active" type="button" aria-pressed="true">RSS / Atom</button>
+            <button id="segContent" class="seg-btn" type="button" aria-pressed="false">Markdown dir</button>
           </div>
           <div id="rssFields">
             <label class="field">
-              <span>Feed URL</span>
-              <input id="rssUrl" type="url" placeholder="https://blog.example.com/rss.xml" />
+              <span>Feed URL <em>(or the blog's home page)</em></span>
+              <input id="rssUrl" type="text" inputmode="url" autocomplete="url" spellcheck="false" placeholder="https://blog.example.com/rss.xml" />
             </label>
           </div>
           <div id="contentFields" hidden>
@@ -68,19 +69,21 @@ export function renderStudioPage(config: StudioPageConfig): string {
             <span>How many to pull</span>
             <input id="limit" type="number" min="1" max="50" value="10" />
           </label>
-          <button id="loadBtn" class="btn block" type="button">Load items</button>
-          <p id="loadError" class="error" hidden></p>
-        </div>
+          <button id="loadBtn" class="btn block" type="submit">Load items</button>
+          <p id="loadError" class="error" role="alert" hidden></p>
+        </form>
 
         <div class="panel">
           <h2>2. Issue details</h2>
           <label class="field">
-            <span>Subject</span>
-            <input id="subject" type="text" placeholder="This week in..." />
+            <span>Subject <span id="subjectCount" class="count-hint" aria-hidden="true"></span></span>
+            <input id="subject" type="text" placeholder="This week in..." aria-describedby="subjectHint" />
+            <span id="subjectHint" class="field-hint" hidden></span>
           </label>
           <label class="field">
-            <span>Preheader <em>(inbox preview text)</em></span>
-            <input id="preheader" type="text" placeholder="The one-line teaser under the subject" />
+            <span>Preheader <em>(inbox preview text)</em> <span id="preheaderCount" class="count-hint" aria-hidden="true"></span></span>
+            <input id="preheader" type="text" placeholder="The one-line teaser under the subject" aria-describedby="preheaderHint" />
+            <span id="preheaderHint" class="field-hint" hidden></span>
           </label>
           <label class="field">
             <span>Intro</span>
@@ -94,6 +97,7 @@ export function renderStudioPage(config: StudioPageConfig): string {
             <button id="improveBtn" class="btn ghost" type="button" ${config.writerLabel ? "" : "disabled"}>✨ Improve with ${escapeHtml(config.writerLabel ?? "AI")}</button>
             ${config.writerLabel ? "" : '<span class="hint">Set OPENAI_API_KEY + AI_MODEL, or pass --agent-command</span>'}
           </div>
+          <p id="improveError" class="error" role="alert" hidden></p>
           <div class="draft-row">
             <button id="exportBtn" class="btn tiny" type="button">↓ Save draft</button>
             <label class="btn tiny" for="importInput">↑ Open draft</label>
@@ -110,7 +114,14 @@ export function renderStudioPage(config: StudioPageConfig): string {
           </div>
           <p class="muted small">Untick to drop an item. Drag the handle or use the arrows to reorder. Click a title or summary to edit it.</p>
           <div id="itemList" class="item-list">
-            <div class="empty">Load a source to start curating.</div>
+            <div class="empty start">
+              <strong>Start with a source</strong>
+              <ol>
+                <li>Paste a feed URL or a blog's home page, or pick a Markdown folder.</li>
+                <li>Untick, reorder, and edit the items here.</li>
+                <li>Check the preview, send a test, then send with SMTPfast.</li>
+              </ol>
+            </div>
           </div>
         </div>
       </section>
@@ -119,24 +130,35 @@ export function renderStudioPage(config: StudioPageConfig): string {
         <div class="panel fill">
           <div class="preview-head">
             <h2>4. Preview</h2>
-            <div class="tabs">
-              <button id="tabEmail" class="tab active" type="button">Email</button>
-              <button id="tabText" class="tab" type="button">Text</button>
+            <div class="preview-controls">
+              <div class="tabs" role="tablist" aria-label="Preview format">
+                <button id="tabEmail" class="tab active" type="button" role="tab" aria-selected="true" aria-controls="previewFrame">Email</button>
+                <button id="tabText" class="tab" type="button" role="tab" aria-selected="false" aria-controls="previewText">Text</button>
+              </div>
+              <div class="tabs" role="group" aria-label="Preview width">
+                <button id="viewDesktop" class="tab active" type="button" aria-pressed="true" title="Desktop width">Desktop</button>
+                <button id="viewMobile" class="tab" type="button" aria-pressed="false" title="Phone width (375px)">Mobile</button>
+              </div>
             </div>
           </div>
-          <div class="preview-body">
-            <iframe id="previewFrame" title="Email preview"></iframe>
+          <div id="inboxRow" class="inbox-row" hidden>
+            <span class="sr-only">Inbox preview:</span>
+            <span id="inboxFrom" class="inbox-from"></span>
+            <span class="inbox-text"><strong id="inboxSubject"></strong><span id="inboxPreheader" class="inbox-pre"></span></span>
+          </div>
+          <div id="previewBody" class="preview-body">
+            <iframe id="previewFrame" title="Email preview" hidden></iframe>
             <pre id="previewText" hidden></pre>
-            <div id="previewEmpty" class="empty">Your rendered email shows up here.</div>
+            <div id="previewEmpty" class="empty preview-empty">Your rendered email shows up here.</div>
           </div>
         </div>
       </section>
     </main>
 
     <div id="sendOverlay" class="overlay" hidden>
-      <div class="drawer">
+      <div id="sendDrawer" class="drawer" role="dialog" aria-modal="true" aria-labelledby="sendTitle">
         <div class="drawer-head">
-          <h2>Send with SMTPfast</h2>
+          <h2 id="sendTitle">Send with SMTPfast</h2>
           <button id="closeSend" class="icon-btn" type="button" aria-label="Close">×</button>
         </div>
         <p class="muted small">Feedletter builds the email. <a href="${config.signupUrl}" target="_blank" rel="noopener">SMTPfast</a> delivers it: verified domains, per-recipient unsubscribe, and a real sending reputation. No account yet? <a href="${config.signupUrl}" target="_blank" rel="noopener">Create one free</a>.</p>
@@ -151,8 +173,9 @@ export function renderStudioPage(config: StudioPageConfig): string {
         <label class="field">
           <span>From address <em>(a verified SMTPfast domain)</em></span>
           <input id="fromAddr" type="email" placeholder="you@yourdomain.com" value="${escapeAttr(config.defaultFrom)}" />
-          <span id="fromStatus" class="from-status" hidden></span>
+          <span id="fromStatus" class="from-status" aria-live="polite" hidden></span>
         </label>
+        <label class="field-label" for="testTo">Test address</label>
         <div class="test-row">
           <input id="testTo" type="email" placeholder="you@example.com" />
           <button id="sendTestBtn" class="btn" type="button">Send test</button>
@@ -220,6 +243,8 @@ body{margin:0;background:var(--bg);color:var(--ink);font-family:var(--sans);font
 ::-webkit-scrollbar-thumb{background:rgba(255,255,255,.16);border-radius:3px}
 ::-webkit-scrollbar-thumb:hover{background:rgba(255,255,255,.24)}
 .mono,code{font-family:var(--mono)}
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.btn:focus-visible,.seg-btn:focus-visible,.tab:focus-visible,.move:focus-visible,.icon-btn:focus-visible,.source-bar:focus-visible,.item .chk:focus-visible,label.btn:focus-within{outline:2px solid var(--em2);outline-offset:2px}
 h2{font-family:var(--mono);font-size:11px;text-transform:uppercase;letter-spacing:.14em;color:var(--muted);margin:0 0 12px;font-weight:500}
 a{color:var(--em2);text-underline-offset:2px}
 .topbar{position:sticky;top:0;z-index:5;display:flex;align-items:center;justify-content:space-between;gap:16px;padding:12px 20px;
@@ -229,13 +254,13 @@ a{color:var(--em2);text-underline-offset:2px}
 .brand strong{display:block;font-family:var(--display);font-size:16px;font-weight:700;letter-spacing:-.01em}
 .brand .tag{font-family:var(--mono);font-size:10.5px;color:var(--muted);letter-spacing:.02em}
 .top-actions{display:flex;align-items:center;gap:12px}
-.status{font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+.status{font-family:var(--mono);font-size:11px;padding:5px 10px;border-radius:999px;border:1px solid var(--line);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:min(46vw,420px)}
 .status.ok{color:var(--ok);border-color:rgba(52,211,153,.4);box-shadow:0 0 14px rgba(16,185,129,.12)}
 .status.err{color:var(--danger);border-color:rgba(248,113,113,.4)}
 .grid{position:relative;z-index:1;display:grid;grid-template-columns:320px minmax(360px,1fr) minmax(380px,1fr);gap:16px;padding:16px;align-items:start;height:calc(100vh - 59px)}
-.col{display:flex;flex-direction:column;gap:16px;min-height:0;height:100%}
+.col{display:flex;flex-direction:column;gap:16px;min-height:0;min-width:0;height:100%}
 .panel{background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:16px;animation:fade-in .4s ease-out}
-.panel.fill{flex:1;display:flex;flex-direction:column;min-height:0}
+.panel.fill{flex:1;display:flex;flex-direction:column;min-height:0;min-width:0}
 .source-col{overflow:auto}
 .field{display:block;margin:0 0 12px}
 .field>span{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
@@ -269,7 +294,11 @@ textarea{resize:vertical}
 .source-bar-change{font-family:var(--mono);font-size:10.5px;text-transform:uppercase;letter-spacing:.1em;color:var(--muted)}
 .error{color:var(--danger);font-size:12px;margin:8px 0 0}
 .muted{color:var(--muted)} .small{font-size:12px} .count{font-family:var(--mono);font-size:11px;color:var(--muted)}
-.curate-head,.preview-head{display:flex;align-items:center;justify-content:space-between}
+.curate-head,.preview-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:6px}
+.curate-head h2,.preview-head h2{margin:0}
+.preview-controls{display:flex;gap:8px;flex-wrap:wrap}
+.preview-controls .tab{margin-left:0}
+.tabs{display:inline-flex;gap:4px}
 .item-list{margin-top:10px;overflow:auto;display:flex;flex-direction:column;gap:10px;padding-right:4px}
 .item{border:1px solid var(--line);border-radius:12px;background:#0a0a0b;padding:10px 12px;display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:start;transition:.15s}
 .item:hover{border-color:rgba(255,255,255,.16)}
@@ -286,7 +315,23 @@ textarea{resize:vertical}
 .item .moves{display:flex;flex-direction:column;gap:4px}
 .move{border:1px solid var(--line);background:#141415;color:var(--muted);border-radius:6px;width:24px;height:22px;cursor:pointer;font-size:11px;line-height:1;padding:0}
 .move:hover{color:var(--ink)}
+.move:disabled{opacity:.3;cursor:default}
 .empty{color:var(--faint);text-align:center;padding:36px 12px;border:1px dashed var(--line);border-radius:12px}
+.empty.start{text-align:left;padding:22px 22px 18px;color:var(--muted)}
+.empty.start strong{display:block;color:var(--ink);font-family:var(--display);font-size:16px;margin-bottom:8px}
+.empty.start ol{margin:0;padding-left:18px;line-height:1.7}
+.preview-body .preview-empty{position:absolute;inset:0;display:grid;place-items:center;background:var(--panel-2);color:var(--muted);padding:24px;line-height:1.6;border:0;border-radius:0}
+.inbox-row{display:flex;align-items:center;gap:12px;min-width:0;margin-top:4px;padding:10px 12px;border-radius:10px;background:#ffffff;color:#202124;font-family:Arial,Helvetica,sans-serif;font-size:13px;white-space:nowrap;overflow:hidden;border:1px solid var(--line)}
+.inbox-from{flex:none;max-width:30%;overflow:hidden;text-overflow:ellipsis;font-weight:700}
+.inbox-text{min-width:0;overflow:hidden;text-overflow:ellipsis}
+.inbox-pre{color:#5f6368;font-weight:400}
+.inbox-pre:not(:empty)::before{content:" - "}
+.count-hint{font-family:var(--mono);font-size:10.5px;color:var(--faint);margin-left:6px}
+.count-hint.warn,.field-hint.warn{color:#fbbf24}
+.field-hint{margin-top:6px;font-size:11.5px;color:var(--faint)}
+.field-label{display:block;font-size:12px;color:var(--muted);margin-bottom:6px}
+.preview-body.mobile{background:#d5dbe3}
+.preview-body.mobile iframe{width:375px;max-width:100%;margin:0 auto;box-shadow:0 0 0 1px rgba(0,0,0,.08),0 10px 40px rgba(0,0,0,.25)}
 .preview-body{flex:1;position:relative;margin-top:10px;border-radius:12px;overflow:hidden;background:#e9edf2;min-height:0;border:1px solid var(--line)}
 iframe{width:100%;height:100%;border:0;display:block;background:#e9edf2}
 #previewText{margin:0;height:100%;overflow:auto;background:#050506;color:#d4d4d8;padding:16px;white-space:pre-wrap;font-family:var(--mono);font-size:12px}
@@ -316,7 +361,19 @@ iframe{width:100%;height:100%;border:0;display:block;background:#e9edf2}
 @keyframes fade-in{from{opacity:0}to{opacity:1}}
 @keyframes slide-in{from{opacity:0;transform:translateX(16px)}to{opacity:1;transform:translateX(0)}}
 @media (prefers-reduced-motion:reduce){*{animation:none !important}}
-@media (max-width:1080px){.grid{grid-template-columns:1fr;height:auto}.col{height:auto}.preview-body{height:60vh}.item-list{max-height:none}}
+@media (max-width:1080px){.grid{grid-template-columns:minmax(0,1fr);height:auto}.col{height:auto}.preview-body{height:70vh}.item-list{max-height:none}}
+@media (max-width:640px){
+  .topbar{padding:10px 14px;gap:10px;backdrop-filter:none;background:rgba(5,5,5,.96)}
+  .brand .tag{display:none}
+  .brand .logo{width:30px;height:30px;font-size:16px}
+  .top-actions{gap:8px;min-width:0}
+  .top-actions .status{display:none}
+  /* Errors stay visible on phones: a bar at the bottom of the screen; tap to dismiss. */
+  .top-actions .status.err{display:block;position:fixed;left:10px;right:10px;bottom:10px;z-index:30;max-width:none;white-space:normal;padding:10px 12px;font-size:12px;line-height:1.45;border-radius:10px;background:#1c0d0d;cursor:pointer}
+  #openSend{padding:8px 12px;font-size:13px;white-space:nowrap}
+  .grid{padding:10px;gap:10px}
+  .drawer{width:100vw;padding:16px}
+}
 `;
 
 const SCRIPT = `
@@ -328,10 +385,12 @@ let uid = 0;
 
 function setStatus(msg, kind){
   const pill = $("statusPill");
+  $("liveRegion").textContent = msg || "";
   if(!msg){ pill.hidden = true; return; }
-  pill.hidden = false; pill.textContent = msg;
+  pill.hidden = false; pill.textContent = msg; pill.title = msg;
   pill.className = "status" + (kind ? " "+kind : "");
 }
+$("statusPill").addEventListener("click", ()=>{ $("statusPill").hidden = true; });
 
 // ---- source toggle ----
 $("segRss").onclick = () => switchSource("rss");
@@ -340,13 +399,15 @@ function switchSource(type){
   state.sourceType = type;
   $("segRss").classList.toggle("active", type==="rss");
   $("segContent").classList.toggle("active", type==="content");
+  $("segRss").setAttribute("aria-pressed", String(type==="rss"));
+  $("segContent").setAttribute("aria-pressed", String(type==="content"));
   $("rssFields").hidden = type!=="rss";
   $("contentFields").hidden = type!=="content";
 }
 if(cfg.defaultContentDir){ $("contentDir").value = cfg.defaultContentDir; }
 
 // ---- load ----
-$("loadBtn").onclick = load;
+$("sourcePanel").addEventListener("submit", (e)=>{ e.preventDefault(); load(); });
 async function load(){
   const btn = $("loadBtn"); const err = $("loadError"); err.hidden = true;
   btn.disabled = true; btn.textContent = "Loading…";
@@ -357,13 +418,16 @@ async function load(){
     const res = await fetch("/api/load",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     const data = await res.json();
     if(!res.ok){ throw new Error(data.error||"Load failed"); }
+    if(!data.items || data.items.length===0){
+      throw new Error(state.sourceType==="rss" ? "That feed has no items yet. Check that it is the right feed." : "No .md or .mdx files found in that folder.");
+    }
     state.sourceLabel = data.sourceLabel || "Digest";
     state.items = (data.items||[]).map((it)=>({ ...it, included: !it.seen, _id:++uid }));
     autoDraft();
     renderItems(); schedulePreview(); enableSend(); collapseSource();
     const seenCount = state.items.filter((i)=>i.seen).length;
     setStatus(state.items.length + " loaded" + (seenCount ? " · " + seenCount + " already sent" : ""), "ok");
-  }catch(e){ err.textContent = e.message; err.hidden = false; setStatus("Load failed","err"); }
+  }catch(e){ err.textContent = e.message; err.hidden = false; setStatus("Load failed","err"); $("rssUrl").focus(); }
   finally{ btn.disabled = false; btn.textContent = "Load items"; }
 }
 function defaultSubject(){
@@ -403,48 +467,69 @@ function renderItems(){
 function updateCount(){
   const inc = includedItems().length;
   $("includeCount").textContent = state.items.length ? (inc + " of " + state.items.length + " included") : "no items yet";
+  enableSend();
 }
 function itemCard(item, index){
   const el = document.createElement("div");
   el.className = "item" + (item.included ? "" : " dropped");
-  el.draggable = true; el.dataset.index = String(index);
-  const meta = [item.date ? new Date(item.date).toLocaleDateString("en",{month:"short",day:"numeric"}) : "", item.author||"", hostOf(item.url)].filter(Boolean).join(" · ");
+  el.dataset.index = String(index);
+  const meta = [item.date ? formatDay(item.date) : "", item.author||"", hostOf(item.url)].filter(Boolean).join(" · ");
   el.innerHTML =
     '<div style="display:flex;flex-direction:column;gap:8px;align-items:center">'
-      + '<span class="handle" title="Drag to reorder">⠿</span>'
-      + '<input class="chk" type="checkbox" ' + (item.included?"checked":"") + ' title="Include in digest">'
+      + '<span class="handle" title="Drag to reorder" aria-hidden="true">⠿</span>'
+      + '<input class="chk" type="checkbox" ' + (item.included?"checked":"") + '>'
     + '</div>'
     + '<div class="body">'
       + (item.seen ? '<span class="badge" title="This item was sent in a previous digest">already sent</span>' : '')
-      + '<div class="ttl" contenteditable="true" spellcheck="false"></div>'
-      + '<div class="sum" contenteditable="true" spellcheck="false" data-empty="Add a summary…"></div>'
+      + '<div class="ttl" contenteditable="true" role="textbox" aria-label="Item title" spellcheck="false"></div>'
+      + '<div class="sum" contenteditable="true" role="textbox" aria-multiline="true" aria-label="Item summary" spellcheck="false" data-empty="Add a summary…"></div>'
       + (meta ? '<div class="meta">'+escapeHtml(meta)+'</div>' : '')
     + '</div>'
     + '<div class="moves">'
-      + '<button class="move" data-move="up" title="Move up">▲</button>'
-      + '<button class="move" data-move="down" title="Move down">▼</button>'
+      + '<button class="move" type="button" data-move="up" title="Move up" aria-label="Move up"' + (index===0 ? ' disabled' : '') + '>▲</button>'
+      + '<button class="move" type="button" data-move="down" title="Move down" aria-label="Move down"' + (index===state.items.length-1 ? ' disabled' : '') + '>▼</button>'
     + '</div>';
-  el.querySelector(".ttl").textContent = item.title || "";
+  const chk = el.querySelector(".chk");
+  const ttl = el.querySelector(".ttl");
+  const labelChk = ()=> chk.setAttribute("aria-label", "Include " + (item.title || "Untitled"));
+  ttl.textContent = item.title || "";
   el.querySelector(".sum").textContent = item.summary || "";
-  el.querySelector(".chk").onchange = (e)=>{ item.included = e.target.checked; el.classList.toggle("dropped", !item.included); updateCount(); schedulePreview(); };
-  el.querySelector(".ttl").addEventListener("input", (e)=>{ item.title = e.target.textContent.trim(); schedulePreview(); });
+  labelChk();
+  chk.onchange = (e)=>{ item.included = e.target.checked; el.classList.toggle("dropped", !item.included); updateCount(); schedulePreview(); };
+  ttl.addEventListener("keydown", (e)=>{ if(e.key==="Enter"){ e.preventDefault(); ttl.blur(); } });
+  ttl.addEventListener("input", (e)=>{ item.title = e.target.textContent.trim(); labelChk(); schedulePreview(); });
   el.querySelector(".sum").addEventListener("input", (e)=>{ item.summary = e.target.textContent.trim(); schedulePreview(); });
-  el.querySelectorAll(".move").forEach((b)=> b.onclick = ()=> moveItem(index, b.dataset.move==="up"?-1:1));
+  el.querySelectorAll(".move").forEach((b)=> b.onclick = ()=> moveItem(index, b.dataset.move==="up"?-1:1, b.dataset.move));
   wireDrag(el);
   return el;
 }
+// Date-only values (2026-05-30) are calendar days: show them in UTC so they do not slip a day.
+// Real timestamps, midnight included, are shown in the viewer's time zone.
+function formatDay(value){
+  const d = new Date(value);
+  if(isNaN(d.getTime())) return "";
+  const dateOnly = /^\\d{4}-\\d{2}-\\d{2}$/.test(String(value).trim());
+  return d.toLocaleDateString("en", dateOnly ? {month:"short",day:"numeric",timeZone:"UTC"} : {month:"short",day:"numeric"});
+}
 function hostOf(url){ try{ return new URL(url).hostname.replace(/^www\\./,""); }catch{ return ""; } }
-function moveItem(index, delta){
+function moveItem(index, delta, dir){
   const next = index + delta;
   if(next<0 || next>=state.items.length) return;
   const [it] = state.items.splice(index,1);
   state.items.splice(next,0,it);
   renderItems(); schedulePreview();
+  // Keep keyboard focus on the item that moved.
+  const card = $("itemList").querySelector('.item[data-index="'+next+'"]');
+  if(card){ const btn = card.querySelector('.move[data-move="'+dir+'"]:not([disabled])') || card.querySelector(".move:not([disabled])"); if(btn) btn.focus(); }
+  setStatus("Moved to position " + (next+1), "ok");
 }
 let dragFrom = null;
+// Only the handle starts a drag, so text in the title and summary stays selectable.
 function wireDrag(el){
+  el.querySelector(".handle").addEventListener("mousedown",()=>{ el.draggable = true; });
+  el.addEventListener("mouseup",()=>{ el.draggable = false; });
   el.addEventListener("dragstart",()=>{ dragFrom = Number(el.dataset.index); el.classList.add("dragging"); });
-  el.addEventListener("dragend",()=> el.classList.remove("dragging"));
+  el.addEventListener("dragend",()=>{ el.classList.remove("dragging"); el.draggable = false; });
   el.addEventListener("dragover",(e)=> e.preventDefault());
   el.addEventListener("drop",(e)=>{ e.preventDefault(); const to = Number(el.dataset.index);
     if(dragFrom===null||dragFrom===to) return; const [it]=state.items.splice(dragFrom,1); state.items.splice(to,0,it); dragFrom=null; renderItems(); schedulePreview(); });
@@ -452,6 +537,25 @@ function wireDrag(el){
 
 // ---- meta fields ----
 ["subject","preheader","intro","footerNote"].forEach((id)=> $(id).addEventListener("input", schedulePreview));
+$("fromName").addEventListener("input", updateMeta);
+function lengthHint(id, max, advice){
+  const n = $(id).value.length;
+  const count = $(id+"Count"), hint = $(id+"Hint");
+  count.textContent = n ? n + "/" + max : "";
+  count.classList.toggle("warn", n > max);
+  hint.hidden = n <= max;
+  hint.className = "field-hint warn";
+  hint.textContent = n > max ? advice : "";
+}
+// Character counts plus a mock inbox row, so the subject and preheader are judged as a reader sees them.
+function updateMeta(){
+  lengthHint("subject", 72, "Long subjects get cut off in most inboxes. Aim for 72 characters or fewer.");
+  lengthHint("preheader", 120, "Inboxes show about 40 to 120 characters of this, depending on the screen.");
+  $("inboxRow").hidden = state.items.length===0;
+  $("inboxFrom").textContent = $("fromName").value.trim() || state.sourceLabel || "Your newsletter";
+  $("inboxSubject").textContent = $("subject").value.trim() || "(no subject)";
+  $("inboxPreheader").textContent = $("preheader").value.trim();
+}
 
 // ---- preview ----
 function itemPayload(i){ return { title:i.title, url:i.url, summary:i.summary, date:i.date, author:i.author, source:i.source, image:i.image }; }
@@ -466,17 +570,34 @@ function draft(){
     items: includedItems().map(itemPayload),
   };
 }
-function schedulePreview(){ clearTimeout(previewTimer); previewTimer = setTimeout(refreshPreview, 320); }
+function schedulePreview(){ updateMeta(); clearTimeout(previewTimer); previewTimer = setTimeout(refreshPreview, 320); }
+function showPreviewEmpty(message){
+  $("previewEmpty").textContent = message;
+  $("previewEmpty").hidden = false;
+  $("previewFrame").srcdoc = "";
+  state.lastHtml = ""; state.lastText = "";
+  setTab(state.activeTab);
+}
 async function refreshPreview(){
-  if(includedItems().length===0){ $("previewEmpty").hidden=false; $("previewFrame").srcdoc=""; return; }
+  if(includedItems().length===0){
+    if(state.items.length===0) return showPreviewEmpty("Your rendered email shows up here.");
+    if(state.items.every((i)=>i.seen)) return showPreviewEmpty("Every item here went out in an earlier issue, so none are ticked. Tick the ones you want to send again.");
+    return showPreviewEmpty("Tick at least one item to build the email.");
+  }
   try{
     const res = await fetch("/api/render",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(draft())});
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"Render failed");
     state.lastHtml = data.html; state.lastText = data.text;
-    $("previewEmpty").hidden = true;
-    $("previewFrame").srcdoc = data.html;
+    const frame = $("previewFrame");
+    // Keep the reader's scroll position while they edit, and open preview links in a new tab.
+    let y = 0;
+    try{ y = frame.contentWindow ? frame.contentWindow.scrollY : 0; }catch(err){}
+    frame.onload = ()=>{ try{ frame.contentWindow.scrollTo(0, y); }catch(err){} };
+    frame.srcdoc = data.html.replace("<head>", '<head><base target="_blank">');
     $("previewText").textContent = data.text;
+    $("previewEmpty").hidden = true;
+    setTab(state.activeTab);
   }catch(e){ setStatus(e.message,"err"); }
 }
 
@@ -485,16 +606,30 @@ $("tabEmail").onclick = ()=> setTab("email");
 $("tabText").onclick = ()=> setTab("text");
 function setTab(t){
   state.activeTab = t;
+  const empty = !$("previewEmpty").hidden;
   $("tabEmail").classList.toggle("active", t==="email");
   $("tabText").classList.toggle("active", t==="text");
-  $("previewFrame").hidden = t!=="email";
-  $("previewText").hidden = t!=="text";
+  $("tabEmail").setAttribute("aria-selected", String(t==="email"));
+  $("tabText").setAttribute("aria-selected", String(t==="text"));
+  $("previewFrame").hidden = empty || t!=="email";
+  $("previewText").hidden = empty || t!=="text";
+}
+$("viewDesktop").onclick = ()=> setView("desktop");
+$("viewMobile").onclick = ()=> setView("mobile");
+function setView(v){
+  $("previewBody").classList.toggle("mobile", v==="mobile");
+  $("viewDesktop").classList.toggle("active", v!=="mobile");
+  $("viewMobile").classList.toggle("active", v==="mobile");
+  $("viewDesktop").setAttribute("aria-pressed", String(v!=="mobile"));
+  $("viewMobile").setAttribute("aria-pressed", String(v==="mobile"));
+  try{ localStorage.setItem("feedletter.previewView", v); }catch(e){}
 }
 
 // ---- AI improve ----
 $("improveBtn").onclick = improve;
 async function improve(){
   const btn = $("improveBtn"); btn.disabled=true; const label=btn.textContent; btn.innerHTML='<span class="spin"></span> Improving…';
+  const errEl = $("improveError"); errEl.hidden = true;
   try{
     const res = await fetch("/api/enrich",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({...draft(), tone:"clear, useful, developer-friendly"})});
     const data = await res.json();
@@ -508,15 +643,37 @@ async function improve(){
       renderItems();
     }
     schedulePreview(); setStatus("Polished with AI","ok");
-  }catch(e){ setStatus(e.message,"err"); }
+  }catch(e){ errEl.textContent = e.message; errEl.hidden = false; setStatus("Improve failed","err"); }
   finally{ btn.disabled=false; btn.textContent=label; }
 }
 
 // ---- send drawer ----
 function enableSend(){ $("openSend").disabled = includedItems().length===0; }
-$("openSend").onclick = ()=>{ $("sendOverlay").hidden=false; };
-$("closeSend").onclick = ()=>{ $("sendOverlay").hidden=true; };
-$("sendOverlay").addEventListener("click",(e)=>{ if(e.target===$("sendOverlay")) $("sendOverlay").hidden=true; });
+let lastFocus = null;
+function openDrawer(){
+  lastFocus = document.activeElement;
+  $("sendOverlay").hidden = false;
+  const first = ["apiKey","fromAddr","testTo"].map($).find((el)=> !el.value) || $("sendBtn");
+  first.focus();
+}
+function closeDrawer(){
+  $("sendOverlay").hidden = true;
+  if(lastFocus && lastFocus.focus) lastFocus.focus();
+}
+$("openSend").onclick = openDrawer;
+$("closeSend").onclick = closeDrawer;
+$("sendOverlay").addEventListener("click",(e)=>{ if(e.target===$("sendOverlay")) closeDrawer(); });
+// Dialog behaviour: Escape closes it and Tab stays inside it.
+document.addEventListener("keydown",(e)=>{
+  if($("sendOverlay").hidden) return;
+  if(e.key==="Escape"){ e.preventDefault(); closeDrawer(); return; }
+  if(e.key!=="Tab") return;
+  const focusable = Array.from($("sendDrawer").querySelectorAll("a[href],button:not([disabled]),input:not([disabled]),textarea:not([disabled]),select:not([disabled])")).filter((el)=> el.offsetParent!==null);
+  if(focusable.length===0) return;
+  const first = focusable[0], last = focusable[focusable.length-1];
+  if(e.shiftKey && document.activeElement===first){ e.preventDefault(); last.focus(); }
+  else if(!e.shiftKey && document.activeElement===last){ e.preventDefault(); first.focus(); }
+});
 const savedKey = localStorage.getItem("feedletter.apiKey");
 if(savedKey){ $("apiKey").value = savedKey; $("rememberKey").checked = true; }
 
@@ -619,6 +776,7 @@ $("importInput").onchange = (e)=>{
 
 function escapeHtml(v){ return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 setTab("email");
+try{ if(localStorage.getItem("feedletter.previewView")==="mobile") setView("mobile"); }catch(e){}
 
 // Deep-link a source: /?feed=<url> or /?dir=<path>&base=<url>
 (function seedFromQuery(){
