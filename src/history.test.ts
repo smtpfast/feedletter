@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { HistoryStore, itemHistoryKey } from "./history.js";
@@ -37,7 +38,7 @@ describe("HistoryStore", () => {
     const store = await HistoryStore.open(dbPath);
     expect(store.seenKeys(items).size).toBe(0);
 
-    await store.recordIssue(issueOf(items));
+    await store.exclusive(() => store.recordIssue(issueOf(items)));
     expect(store.seenKeys(items).size).toBe(2);
     store.close();
 
@@ -51,9 +52,97 @@ describe("HistoryStore", () => {
     reopened.close();
   });
 
+  it("does not write the file when it is opened", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath);
+    expect(existsSync(dbPath)).toBe(false);
+    await store.exclusive(() => store.recordIssue(issueOf(items)));
+    expect(existsSync(dbPath)).toBe(true);
+    store.close();
+  });
+
+  it("refuses to write outside the lock", async () => {
+    const store = await HistoryStore.open(path.join(dir, "history.sqlite"));
+    await expect(store.recordIssue(issueOf(items))).rejects.toThrow(/outside its lock/);
+    store.close();
+  });
+
   it("keys items by url so titles can change", () => {
     const a = itemHistoryKey({ title: "Original", url: "https://example.com/x" });
     const b = itemHistoryKey({ title: "Renamed", url: "https://example.com/x" });
     expect(a).toBe(b);
   });
 });
+
+describe("HistoryStore send lock", () => {
+  it("refuses a second send while another holds the lock", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const a = await HistoryStore.open(dbPath);
+    const b = await HistoryStore.open(dbPath);
+    let release!: () => void;
+    let holding!: Promise<void>;
+    // Wait until a really holds the lock before b tries.
+    await new Promise<void>((held) => {
+      holding = a.exclusive(() => new Promise<void>((resolve) => {
+        release = resolve;
+        held();
+      }));
+    });
+    await expect(b.exclusive(async () => "sent")).rejects.toThrow(/Another feedletter send is using .*process \d+/);
+    release();
+    await holding;
+    await expect(b.exclusive(async () => "sent")).resolves.toBe("sent");
+    a.close();
+    b.close();
+  });
+
+  it("stops, and leaves the lock in place, when the process that held it is gone", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath);
+    await writeFile(`${dbPath}.lock`, "2147483646\n");
+    let ran = false;
+    await expect(store.exclusive(async () => (ran = true))).rejects.toThrow(
+      /A previous send did not finish: .*history\.sqlite\.lock is still there \(process 2147483646\)\. If no other Feedletter is running/,
+    );
+    expect(ran).toBe(false);
+    expect(existsSync(`${dbPath}.lock`)).toBe(true);
+    store.close();
+  });
+
+  it("keeps earlier sends when a --resend batch is refused", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath);
+    await store.exclusive(async () => {
+      await store.recordRecipients("key", [{ recipient: "sent@example.com", id: "e1" }]);
+      await store.recordRecipients("key", [{ recipient: "maybe@example.com" }], "uncertain");
+      // A --resend writes the batch ahead, then SMTPfast answers 4xx.
+      const batch = ["sent@example.com", "maybe@example.com", "new@example.com"];
+      await store.recordRecipients("key", batch.map((recipient) => ({ recipient })), "uncertain");
+      await store.forgetRecipients("key", batch);
+    });
+    expect([...store.sentRecipients("key")].sort()).toEqual([
+      ["maybe@example.com", "uncertain"],
+      ["sent@example.com", "sent"],
+    ]);
+    store.close();
+  });
+
+  it("keeps both processes' progress instead of overwriting it", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    // Both open before either writes, like a running studio and a CLI send.
+    const a = await HistoryStore.open(dbPath);
+    const b = await HistoryStore.open(dbPath);
+    await a.exclusive(() => a.recordRecipients("key", [{ recipient: "one@example.com" }]));
+    await b.exclusive(() => b.recordRecipients("key", [{ recipient: "two@example.com" }], "uncertain"));
+    a.close();
+    b.close();
+
+    const reopened = await HistoryStore.open(dbPath);
+    expect([...reopened.sentRecipients("key")].sort()).toEqual([
+      ["one@example.com", "sent"],
+      ["two@example.com", "uncertain"],
+    ]);
+    reopened.close();
+  });
+});
+

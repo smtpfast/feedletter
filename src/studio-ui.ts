@@ -166,6 +166,10 @@ export function renderStudioPage(config: StudioPageConfig): string {
           <span>SMTPfast API key</span>
           <input id="apiKey" type="password" placeholder="sf_..." autocomplete="off" />
         </label>
+        <label class="check">
+          <input id="rememberKey" type="checkbox" />
+          <span>Remember the API key in this browser</span>
+        </label>
         <label class="field">
           <span>From name <em>(optional, shown as the sender)</em></span>
           <input id="fromName" type="text" placeholder="The Weekly" />
@@ -181,20 +185,42 @@ export function renderStudioPage(config: StudioPageConfig): string {
           <button id="sendTestBtn" class="btn" type="button">Send test</button>
         </div>
         <p class="test-hint">Send one copy to yourself first to check how it looks.</p>
-        <label class="field">
-          <span>Recipients <em>(comma or newline separated)</em></span>
-          <textarea id="recipients" rows="4" placeholder="you@example.com, teammate@example.com"></textarea>
-        </label>
-        <label class="check">
-          <input id="rememberKey" type="checkbox" />
-          <span>Remember the API key in this browser</span>
-        </label>
-        <div class="unsub-note">Each recipient gets their own unsubscribe link via <code>${escapeHtml(config.unsubscribePlaceholder)}</code>. Sending goes one message per recipient, so nobody sees the list.</div>
-        <button id="sendBtn" class="btn primary block" type="button">Send digest</button>
-        <div id="sendResult" class="send-result" hidden></div>
-        <div class="broadcast-note">
-          <strong>Sending to a big list?</strong> Feedletter sends one at a time, which is fine up to ~50. For larger audiences, paste this into a <a href="${config.signupUrl}/dashboard" target="_blank" rel="noopener">SMTPfast broadcast</a> and send to your contacts with analytics.
+
+        <div class="send-to">
+          <span id="sendToLabel" class="field-label">Send to</span>
+          <div class="seg" role="group" aria-labelledby="sendToLabel">
+            <button id="modeContacts" class="seg-btn active" type="button" aria-pressed="true">SMTPfast contacts</button>
+            <button id="modeList" class="seg-btn" type="button" aria-pressed="false">A list of addresses</button>
+          </div>
+        </div>
+
+        <div id="contactsPanel">
+          <label class="field">
+            <span>Audience</span>
+            <select id="audienceSelect"><option value="">All contacts</option></select>
+          </label>
+          <p id="audienceInfo" class="audience-info" aria-live="polite">Paste your API key to see your contacts.</p>
+          <div class="btn-row">
+            <button id="draftBtn" class="btn" type="button">Save as draft</button>
+            <button id="broadcastBtn" class="btn primary" type="button">Send to contacts</button>
+          </div>
+          <p class="test-hint">Sends an SMTPfast broadcast to subscribed contacts. SMTPfast skips unsubscribed and suppressed addresses, adds each person's unsubscribe link, and tracks opens and clicks. A draft waits in SMTPfast until you send it there.</p>
+        </div>
+
+        <div id="listPanel" hidden>
+          <label class="field">
+            <span>Recipients <em>(comma or newline separated)</em></span>
+            <textarea id="recipients" rows="4" placeholder="you@example.com, teammate@example.com"></textarea>
+          </label>
+          <p id="recipientInfo" class="audience-info" aria-live="polite"></p>
+          <div class="unsub-note">Each recipient gets their own unsubscribe link via <code>${escapeHtml(config.unsubscribePlaceholder)}</code>. Feedletter sends one message per recipient, in batches of 100, so nobody sees the list.</div>
+          <button id="sendBtn" class="btn primary block" type="button" disabled>Send digest</button>
+        </div>
+
+        <div id="sendResult" class="send-result" role="status" hidden></div>
+        <div class="copy-row">
           <button id="copyHtmlBtn" class="btn tiny" type="button">Copy email HTML</button>
+          <span class="test-hint">to paste into another tool</span>
         </div>
       </div>
     </div>
@@ -283,9 +309,15 @@ textarea{resize:vertical}
 .btn.tiny{padding:6px 10px;font-size:12px;font-weight:600;border-radius:8px}
 .draft-row{display:flex;gap:8px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
 .draft-row label.btn{display:inline-flex;align-items:center;cursor:pointer}
-.broadcast-note{margin-top:16px;padding:12px;border:1px dashed var(--line);border-radius:10px;font-size:12px;color:var(--muted);line-height:1.55}
-.broadcast-note strong{color:var(--ink)}
-.broadcast-note .btn{margin-top:10px}
+.send-to{margin:6px 0 12px;padding-top:14px;border-top:1px solid var(--line)}
+.send-to .seg{margin-bottom:0}
+.audience-info{font-size:12px;color:var(--muted);margin:-4px 0 12px;line-height:1.5}
+.audience-info.warn{color:#fbbf24}
+.btn-row{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.btn-row .btn{flex:1;white-space:nowrap}
+.btn.armed{background:#f59e0b;border-color:#f59e0b;color:#111;box-shadow:none}
+.copy-row{display:flex;align-items:center;gap:8px;margin-top:16px;padding-top:12px;border-top:1px solid var(--line)}
+.copy-row .test-hint{margin:0}
 .source-bar{display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;text-align:left;
   background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:12px 14px;cursor:pointer;color:var(--ink);font:inherit;animation:fade-in .3s ease-out}
 .source-bar:hover{border-color:rgba(255,255,255,.2)}
@@ -376,7 +408,52 @@ iframe{width:100%;height:100%;border:0;display:block;background:#e9edf2}
 }
 `;
 
+/**
+ * The send buttons' state machine, kept as source so the page and the tests
+ * run the same code.
+ */
+export const SEND_GUARD_SOURCE = `
+function createSendGuard(){
+  let armed = null;
+  let inFlight = null;
+  return {
+    // Returns "busy" while a send runs, "confirmed" on a second press for the
+    // same action and audience token, and "armed" otherwise.
+    press(action, token){
+      if(inFlight) return "busy";
+      if(armed && armed.action===action && armed.token===token){ armed = null; return "confirmed"; }
+      armed = { action, token };
+      return "armed";
+    },
+    disarm(){ const was = armed!==null; armed = null; return was; },
+    isArmed(action){ return armed!==null && armed.action===action; },
+    // Claims the single send slot; false if another send is already running.
+    start(action){ if(inFlight) return false; inFlight = action; armed = null; return true; },
+    finish(){ inFlight = null; },
+    busy(){ return inFlight; },
+  };
+}
+
+function createAudienceTracker(){
+  let seq = 0;
+  let audience = null;
+  let loading = false;
+  return {
+    // A key or segment change: forget the audience now, and ignore any answer already on its way.
+    change(){ seq++; audience = null; loading = false; return seq; },
+    // Start a lookup; the returned token must match when its answer arrives.
+    begin(){ seq++; audience = null; loading = true; return seq; },
+    settle(token, value){ if(token!==seq) return false; audience = value; loading = false; return true; },
+    fail(token){ if(token!==seq) return false; audience = null; loading = false; return true; },
+    current(){ return audience; },
+    loading(){ return loading; },
+    version(){ return seq; },
+  };
+}
+`;
+
 const SCRIPT = `
+${SEND_GUARD_SOURCE}
 const cfg = window.__CONFIG__;
 const $ = (id) => document.getElementById(id);
 const state = { sourceType:"rss", sourceLabel:"Digest", items:[], activeTab:"email", lastHtml:"", lastText:"" };
@@ -653,6 +730,7 @@ let lastFocus = null;
 function openDrawer(){
   lastFocus = document.activeElement;
   $("sendOverlay").hidden = false;
+  if(state.sendMode==="contacts") loadAudience();
   const first = ["apiKey","fromAddr","testTo"].map($).find((el)=> !el.value) || $("sendBtn");
   first.focus();
 }
@@ -674,7 +752,8 @@ document.addEventListener("keydown",(e)=>{
   if(e.shiftKey && document.activeElement===first){ e.preventDefault(); last.focus(); }
   else if(!e.shiftKey && document.activeElement===last){ e.preventDefault(); first.focus(); }
 });
-const savedKey = localStorage.getItem("feedletter.apiKey");
+let savedKey = null;
+try{ savedKey = localStorage.getItem("feedletter.apiKey"); }catch(e){}
 if(savedKey){ $("apiKey").value = savedKey; $("rememberKey").checked = true; }
 
 // ---- verify the From domain against the account ----
@@ -698,40 +777,222 @@ async function verifyFrom(){
   }catch(e){ el.hidden = true; }
 }
 
+// ---- send to: SMTPfast contacts (broadcast) or a list of addresses ----
+// One guard for every send button: a send needs two presses for the same
+// audience, and nothing starts while another send is in flight.
+const guard = createSendGuard();
+const audienceState = createAudienceTracker();
+let armTimer = null;
+
+function setMode(mode){
+  disarmSend();
+  state.sendMode = mode;
+  $("modeContacts").classList.toggle("active", mode==="contacts");
+  $("modeList").classList.toggle("active", mode==="list");
+  $("modeContacts").setAttribute("aria-pressed", String(mode==="contacts"));
+  $("modeList").setAttribute("aria-pressed", String(mode==="list"));
+  $("contactsPanel").hidden = mode!=="contacts";
+  $("listPanel").hidden = mode!=="list";
+  try{ localStorage.setItem("feedletter.sendMode", mode); }catch(e){}
+  if(mode==="contacts") scheduleAudience();
+}
+$("modeContacts").onclick = ()=> setMode("contacts");
+$("modeList").onclick = ()=> setMode("list");
+
+function fmt(n){ return Number(n||0).toLocaleString("en"); }
+function plural(n, word){ return fmt(n) + " " + word + (n===1 ? "" : "s"); }
+function audienceCapped(a){ return !!a && a.broadcastLimit!==undefined && a.broadcastsUsed!==undefined && a.broadcastsUsed >= a.broadcastLimit; }
+function listToken(c){ return "list:" + c.valid.join(",").toLowerCase(); }
+function audienceToken(){ return "contacts:" + audienceState.version(); }
+
+function disarmSend(){ guard.disarm(); clearTimeout(armTimer); refreshSendButtons(); }
+// First press arms and states the count; a second press for the same audience sends.
+function pressSend(action, token, run){
+  const step = guard.press(action, token);
+  if(step==="busy") return;
+  clearTimeout(armTimer);
+  if(step==="armed"){ armTimer = setTimeout(disarmSend, 6000); refreshSendButtons(); return; }
+  run();
+}
+
+// Every send button's label and enabled state comes from here, so an in-flight
+// send keeps all of them disabled until it finishes.
+function refreshSendButtons(){
+  const busy = guard.busy();
+  const c = checkList($("recipients").value);
+  const listBtn = $("sendBtn");
+  listBtn.disabled = !!busy || c.valid.length===0;
+  listBtn.classList.toggle("armed", guard.isArmed("list"));
+  if(busy!=="list"){
+    listBtn.textContent = guard.isArmed("list") ? "Click again to send to " + plural(c.valid.length, "recipient")
+      : (c.valid.length ? "Send to " + plural(c.valid.length, "recipient") : "Send digest");
+  }
+  const a = audienceState.current();
+  const bc = $("broadcastBtn");
+  bc.disabled = !!busy || audienceState.loading() || !a || a.eligible===0 || audienceCapped(a);
+  bc.classList.toggle("armed", guard.isArmed("broadcast"));
+  if(busy!=="broadcast"){
+    bc.textContent = guard.isArmed("broadcast") && a ? "Click again to send to " + plural(a.eligible, "contact")
+      : (a && a.eligible ? "Send to " + plural(a.eligible, "contact") : "Send to contacts");
+  }
+  $("draftBtn").disabled = !!busy;
+  if(busy!=="draft") $("draftBtn").textContent = "Save as draft";
+  $("sendTestBtn").disabled = !!busy;
+  if(busy!=="test") $("sendTestBtn").textContent = "Send test";
+}
+
+// ---- audience (SMTPfast contacts and segments) ----
+let audienceTimer = null;
+// Any change to the key or segment cancels a pending confirmation, drops the
+// audience, and makes any lookup already on its way stale, so sending stays
+// blocked until the new audience has loaded.
+function audienceChanged(){
+  guard.disarm(); clearTimeout(armTimer);
+  audienceState.change();
+  refreshSendButtons();
+}
+function scheduleAudience(){ clearTimeout(audienceTimer); audienceTimer = setTimeout(loadAudience, 600); }
+$("apiKey").addEventListener("input", ()=>{ state.segments = null; audienceChanged(); scheduleAudience(); });
+$("audienceSelect").addEventListener("change", ()=>{ audienceChanged(); loadAudience(); });
+async function loadAudience(){
+  if(state.sendMode!=="contacts" || $("sendOverlay").hidden) return;
+  guard.disarm(); clearTimeout(armTimer);
+  const info = $("audienceInfo"); const key = $("apiKey").value.trim();
+  if(!key){ audienceState.change(); info.className = "audience-info"; info.textContent = "Paste your API key to see your contacts."; refreshSendButtons(); return; }
+  const token = audienceState.begin();
+  refreshSendButtons();
+  info.className = "audience-info"; info.textContent = "Checking your contacts…";
+  try{
+    const res = await fetch("/api/audience",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({apiKey:key, segmentId:$("audienceSelect").value})});
+    const d = await res.json();
+    if(!res.ok) throw new Error(d.error||"Could not check your contacts.");
+    if(!audienceState.settle(token, d)) return;
+    if(!state.segments){
+      state.segments = d.segments || [];
+      const sel = $("audienceSelect"); const current = sel.value;
+      sel.innerHTML = '<option value="">All contacts</option>' + state.segments.map((g)=> '<option value="'+escapeHtml(g.id)+'">'+escapeHtml(g.name)+' ('+fmt(g.contactCount)+')</option>').join("");
+      sel.value = current;
+    }
+    const parts = [plural(d.eligible, "contact") + " will get it"];
+    if(d.skipped) parts[0] += " (" + fmt(d.skipped) + " skipped: unsubscribed, suppressed, or invalid)";
+    if(d.broadcastLimit!==undefined) parts.push("Broadcasts this month: " + fmt(d.broadcastsUsed) + " of " + fmt(d.broadcastLimit) + (d.planLabel ? " (" + d.planLabel + " plan)" : ""));
+    if(d.eligible===0) parts.push("No subscribed contacts yet. Add contacts in SMTPfast, or switch to a list of addresses.");
+    if(audienceCapped(d)) parts.push("This month's broadcasts are used up. You can still save a draft or send to a list.");
+    info.className = "audience-info" + (d.eligible===0 || audienceCapped(d) ? " warn" : "");
+    info.textContent = parts.join(". ") + ".";
+  }catch(e){
+    if(!audienceState.fail(token)) return;
+    info.className = "audience-info warn";
+    info.textContent = e.message + " Sending to contacts needs this check; you can still save a draft.";
+  }finally{
+    refreshSendButtons();
+  }
+}
+$("draftBtn").onclick = ()=> doBroadcast(false);
+$("broadcastBtn").onclick = ()=>{ if(audienceState.current()) pressSend("broadcast", audienceToken(), ()=> doBroadcast(true)); };
+async function doBroadcast(sendNow){
+  const action = sendNow ? "broadcast" : "draft";
+  if(!guard.start(action)) return;
+  const out = $("sendResult"); out.hidden = false; out.className = "send-result";
+  const btn = sendNow ? $("broadcastBtn") : $("draftBtn");
+  refreshSendButtons();
+  btn.innerHTML = '<span class="spin"></span> ' + (sendNow ? "Sending…" : "Saving…");
+  try{
+    rememberKey();
+    const res = await fetch("/api/broadcast",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({
+      apiKey:$("apiKey").value, from:fromHeader(), segmentId:$("audienceSelect").value, send:sendNow, draft:draft(),
+    })});
+    const d = await res.json();
+    if(!res.ok){ const err = new Error(d.error||"Broadcast failed"); err.url = d.url; throw err; }
+    const link = ' <a href="'+escapeHtml(d.url)+'" target="_blank" rel="noopener">Open it in SMTPfast</a>.';
+    out.classList.add("ok");
+    if(sendNow){
+      out.innerHTML = "<strong>Broadcast " + escapeHtml(d.status||"queued") + (d.recipients!==undefined ? " to " + plural(d.recipients, "contact") : "") + ".</strong>"
+        + (d.recovered ? " The answer to the send was lost, but SMTPfast shows it as sent." : "") + link;
+      setStatus("Broadcast sent","ok"); markSent();
+    } else {
+      out.innerHTML = "<strong>" + (d.reused ? "This draft is already in SMTPfast." : "Draft saved in SMTPfast.") + "</strong> Review it and press Send there." + link;
+      setStatus("Draft saved in SMTPfast","ok");
+    }
+  }catch(e){
+    out.classList.add("err");
+    out.innerHTML = escapeHtml(e.message) + (e.url ? ' <a href="'+escapeHtml(e.url)+'" target="_blank" rel="noopener">Open the broadcast</a>.' : "");
+    setStatus(sendNow ? "Broadcast failed" : "Draft failed","err");
+  }finally{ guard.finish(); refreshSendButtons(); }
+}
+
+// ---- recipient list: live count and validation (same check SMTPfast applies) ----
+function checkList(raw){
+  const seen = new Set(); const valid = []; const invalid = []; let duplicates = 0;
+  String(raw||"").split(/[\\s,;]+/).map((v)=> v.trim()).filter(Boolean).forEach((addr)=>{
+    const key = addr.toLowerCase();
+    if(seen.has(key)){ duplicates++; return; }
+    seen.add(key);
+    const domain = addr.slice(addr.lastIndexOf("@")+1).toLowerCase();
+    const ok = addr.length <= 320 && /^[^\\s@<>]+@[^\\s@<>]+\\.[^\\s@<>]+$/.test(addr) && /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/.test(domain);
+    (ok ? valid : invalid).push(addr);
+  });
+  return { valid, invalid, duplicates };
+}
+function updateRecipientInfo(){
+  const c = checkList($("recipients").value);
+  const info = $("recipientInfo");
+  const parts = [];
+  if(c.valid.length) parts.push(plural(c.valid.length, "recipient"));
+  if(c.duplicates) parts.push(plural(c.duplicates, "duplicate") + " removed");
+  if(c.invalid.length) parts.push(fmt(c.invalid.length) + " not valid and skipped: " + c.invalid.slice(0,5).join(", ") + (c.invalid.length>5 ? ", …" : ""));
+  info.textContent = parts.join(" · ");
+  info.className = "audience-info" + (c.invalid.length ? " warn" : "");
+  refreshSendButtons();
+  return c;
+}
+// Editing the list cancels a pending confirmation, since the count may have changed.
+$("recipients").addEventListener("input", ()=>{ guard.disarm(); clearTimeout(armTimer); updateRecipientInfo(); });
+
+function fromHeader(){
+  const name = $("fromName").value.trim(); const addr = $("fromAddr").value.trim();
+  return name && addr ? '"' + name.replace(/["\\\\]/g, "") + '" <' + addr + ">" : addr;
+}
+function rememberKey(){
+  try{ if($("rememberKey").checked){ localStorage.setItem("feedletter.apiKey",$("apiKey").value); } else { localStorage.removeItem("feedletter.apiKey"); } }catch(e){}
+}
+
 // ---- send (digest to the list, or a test to yourself) ----
-$("sendBtn").onclick = ()=> doSend(false);
+$("sendBtn").onclick = ()=>{
+  const c = checkList($("recipients").value); if(!c.valid.length) return;
+  pressSend("list", listToken(c), ()=> doSend(false));
+};
 $("sendTestBtn").onclick = ()=> doSend(true);
 async function doSend(isTest){
+  const action = isTest ? "test" : "list";
+  if(!guard.start(action)) return;
   const out = $("sendResult"); out.hidden=false; out.className="send-result";
   const btn = isTest ? $("sendTestBtn") : $("sendBtn");
-  btn.disabled=true; const label=btn.textContent; btn.innerHTML='<span class="spin"></span> Sending…';
+  refreshSendButtons();
+  btn.innerHTML='<span class="spin"></span> Sending…';
   try{
-    await refreshPreview();
-    if($("rememberKey").checked){ localStorage.setItem("feedletter.apiKey",$("apiKey").value); } else { localStorage.removeItem("feedletter.apiKey"); }
+    rememberKey();
     const recipients = isTest ? $("testTo").value : $("recipients").value;
-    const name = $("fromName").value.trim();
-    const addr = $("fromAddr").value.trim();
-    const from = name && addr ? name + " <" + addr + ">" : addr;
-    const body = {
-      apiKey:$("apiKey").value, from, subject:$("subject").value,
-      recipients, html:state.lastHtml, text:state.lastText, test:isTest, sourceLabel:state.sourceLabel,
-      items: includedItems().map(itemPayload),
-    };
+    const body = { apiKey:$("apiKey").value, from:fromHeader(), recipients, test:isTest, draft:draft() };
     const res = await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"Send failed");
-    const failed = (data.results||[]).filter((r)=>!r.ok);
-    out.classList.add(data.failed? "err":"ok");
-    out.innerHTML = "<strong>"+(isTest?"Test sent":"Sent")+" to "+data.sent+", failed "+data.failed+".</strong>"
-      + (failed.length? "<ul>"+failed.map((r)=>"<li>"+escapeHtml(r.recipient)+": "+escapeHtml(r.error||"")+"</li>").join("")+"</ul>" : "");
-    setStatus(data.failed? "Sent with "+data.failed+" errors" : (isTest?"Test sent":"Sent "+data.sent), data.failed?"err":"ok");
-    if(!isTest && !data.failed) markSent();
+    const failed = (data.results||[]).filter((r)=>!r.ok && !r.suppressed && !r.alreadySent && !r.uncertain);
+    out.classList.add(data.failed || data.uncertain ? "err":"ok");
+    out.innerHTML = "<strong>"+(isTest?"Test sent":"Sent")+" to "+data.sent
+      + (data.alreadySent ? ", skipped "+data.alreadySent+" already sent earlier" : "")
+      + (data.uncertain ? ", "+data.uncertain+" uncertain (check the SMTPfast logs)" : "")
+      + (data.skipped ? ", skipped "+data.skipped+" suppressed" : "")+", failed "+data.failed+".</strong>"
+      + (failed.length? "<ul>"+failed.slice(0,20).map((r)=>"<li>"+escapeHtml(r.recipient)+": "+escapeHtml(r.error||"")+"</li>").join("")+(failed.length>20 ? "<li>and "+(failed.length-20)+" more</li>" : "")+"</ul>" : "");
+    const trouble = data.failed || data.uncertain;
+    setStatus(trouble ? "Sent with problems: see the send panel" : (isTest?"Test sent":"Sent "+data.sent), trouble?"err":"ok");
+    if(!isTest && data.sent > 0) markSent();
   }catch(e){ out.classList.add("err"); out.textContent=e.message; setStatus(e.message,"err"); }
-  finally{ btn.disabled=false; btn.textContent=label; }
+  finally{ guard.finish(); refreshSendButtons(); }
 }
 function markSent(){ includedItems().forEach((i)=> i.seen = true); renderItems(); }
 
-// ---- copy HTML for a SMTPfast broadcast ----
+// ---- copy the email HTML ----
 $("copyHtmlBtn").onclick = async ()=>{
   await refreshPreview();
   try{
@@ -777,6 +1038,10 @@ $("importInput").onchange = (e)=>{
 function escapeHtml(v){ return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;"); }
 setTab("email");
 try{ if(localStorage.getItem("feedletter.previewView")==="mobile") setView("mobile"); }catch(e){}
+let savedMode = "contacts";
+try{ savedMode = localStorage.getItem("feedletter.sendMode")==="list" ? "list" : "contacts"; }catch(e){}
+setMode(savedMode);
+updateRecipientInfo();
 
 // Deep-link a source: /?feed=<url> or /?dir=<path>&base=<url>
 (function seedFromQuery(){
