@@ -109,6 +109,24 @@ describe("HistoryStore send lock", () => {
     store.close();
   });
 
+  it("keeps earlier sends when a --resend batch is refused", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath);
+    await store.exclusive(async () => {
+      await store.recordRecipients("key", [{ recipient: "sent@example.com", id: "e1" }]);
+      await store.recordRecipients("key", [{ recipient: "maybe@example.com" }], "uncertain");
+      // A --resend writes the batch ahead, then SMTPfast answers 4xx.
+      const batch = ["sent@example.com", "maybe@example.com", "new@example.com"];
+      await store.recordRecipients("key", batch.map((recipient) => ({ recipient })), "uncertain");
+      await store.forgetRecipients("key", batch);
+    });
+    expect([...store.sentRecipients("key")].sort()).toEqual([
+      ["maybe@example.com", "uncertain"],
+      ["sent@example.com", "sent"],
+    ]);
+    store.close();
+  });
+
   it("keeps both processes' progress instead of overwriting it", async () => {
     const dbPath = path.join(dir, "history.sqlite");
     // Both open before either writes, like a running studio and a CLI send.

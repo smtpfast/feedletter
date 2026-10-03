@@ -40,6 +40,8 @@ export class HistoryLockError extends Error {
 
 export class HistoryStore {
   private locked = false;
+  /** Rows the current batch's write-ahead created (they did not exist before), per send key. */
+  private writtenAhead = new Map<string, Set<string>>();
 
   private constructor(
     private readonly dbPath: string,
@@ -177,25 +179,47 @@ export class HistoryStore {
     return sent;
   }
 
-  /** Save the addresses of one batch, so a rerun of the same send skips them. */
+  /**
+   * Save the addresses of one batch, so a rerun of the same send skips them.
+   * Writing ahead as uncertain never touches an existing row, so a refused
+   * --resend cannot erase what an earlier run sent.
+   */
   async recordRecipients(sendKey: string, rows: Array<{ recipient: string; id?: string }>, state: RecipientState = "sent") {
+    const ahead = state === "uncertain";
     const stmt = this.db.prepare(
-      "INSERT OR REPLACE INTO sent_recipients (send_key, recipient, email_id, sent_at, state) VALUES (?, ?, ?, ?, ?)",
+      `INSERT OR ${ahead ? "IGNORE" : "REPLACE"} INTO sent_recipients (send_key, recipient, email_id, sent_at, state) VALUES (?, ?, ?, ?, ?)`,
     );
     const now = new Date().toISOString();
+    // Batches go one at a time, so the set only ever holds the current batch.
+    const written = ahead ? new Set<string>() : (this.writtenAhead.get(sendKey) ?? new Set<string>());
     try {
-      for (const row of rows) stmt.run([sendKey, row.recipient.toLowerCase(), row.id ?? null, now, state]);
+      for (const row of rows) {
+        const recipient = row.recipient.toLowerCase();
+        stmt.run([sendKey, recipient, row.id ?? null, now, state]);
+        if (ahead && this.db.getRowsModified() > 0) written.add(recipient);
+        if (!ahead) written.delete(recipient);
+      }
     } finally {
       stmt.free();
     }
+    this.writtenAhead.set(sendKey, written);
     await this.persist();
   }
 
-  /** Remove addresses recorded ahead of a batch that SMTPfast then refused (a 4xx: nothing was queued). */
+  /**
+   * Remove addresses written ahead of a batch that SMTPfast then refused (a
+   * 4xx: nothing was queued). Only rows the write-ahead created are removed;
+   * rows from earlier runs stay as they were.
+   */
   async forgetRecipients(sendKey: string, recipients: string[]) {
+    const written = this.writtenAhead.get(sendKey);
     const stmt = this.db.prepare("DELETE FROM sent_recipients WHERE send_key = ? AND recipient = ?");
     try {
-      for (const recipient of recipients) stmt.run([sendKey, recipient.toLowerCase()]);
+      for (const recipient of recipients.map((r) => r.toLowerCase())) {
+        if (!written?.has(recipient)) continue;
+        stmt.run([sendKey, recipient]);
+        written.delete(recipient);
+      }
     } finally {
       stmt.free();
     }
