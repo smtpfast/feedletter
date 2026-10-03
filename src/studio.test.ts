@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { createServer, type Server } from "node:http";
+import { createServer, request, type Server } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -69,7 +69,41 @@ describe("studio server", () => {
   it("serves the studio page", async () => {
     const res = await fetch(`${base}/`);
     expect(res.status).toBe(200);
-    expect(await res.text()).toContain("Feedletter Studio");
+    const html = await res.text();
+    expect(html).toContain("Feedletter Studio");
+    expect(html).toContain('role="dialog"');
+    expect(html).toContain('id="viewMobile"');
+  });
+
+  it("rejects a cross-origin POST", async () => {
+    const res = await fetch(`${base}/api/render`, {
+      method: "POST",
+      headers: { "content-type": "application/json", origin: "https://evil.example" },
+      body: JSON.stringify({ items: [] }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a POST that is not JSON, which a cross-site form could send without a preflight", async () => {
+    const res = await fetch(`${base}/api/render`, {
+      method: "POST",
+      headers: { "content-type": "text/plain" },
+      body: JSON.stringify({ items: [] }),
+    });
+    expect(res.status).toBe(403);
+  });
+
+  it("rejects a foreign Host header on a loopback bind (DNS rebinding)", async () => {
+    const port = (studio.address() as AddressInfo).port;
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request({ host: "127.0.0.1", port, path: "/", headers: { host: `attacker.example:${port}` } }, (res) => {
+        res.resume();
+        resolve(res.statusCode ?? 0);
+      });
+      req.on("error", reject);
+      req.end();
+    });
+    expect(status).toBe(403);
   });
 
   it("loads items from a content directory", async () => {

@@ -30,6 +30,38 @@ interface ServerContext extends StudioOptions {
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
+
+function hostnameOf(hostHeader: string | undefined) {
+  if (!hostHeader) return "";
+  return hostHeader.startsWith("[") ? hostHeader.slice(0, hostHeader.indexOf("]") + 1) : hostHeader.replace(/:\d+$/, "");
+}
+
+/**
+ * The studio is a local tool that can read local folders, run the writer
+ * command, and send email, so only the studio page itself may call its API.
+ * Returns an error message for a request a web page elsewhere could make.
+ */
+export function rejectForeignRequest(req: IncomingMessage, bindHost: string): string | undefined {
+  const host = hostnameOf(req.headers.host).toLowerCase();
+  // On a loopback bind, a different Host header means DNS rebinding. Binding to
+  // another interface is an explicit opt-in, so any Host is accepted there.
+  if (LOOPBACK_HOSTS.has(bindHost) && !LOOPBACK_HOSTS.has(host)) return "Unknown host.";
+  if (req.method !== "POST") return undefined;
+  const origin = req.headers.origin;
+  if (origin) {
+    let originHost = "";
+    try {
+      originHost = new URL(origin).host.toLowerCase();
+    } catch {
+      return "Cross-origin requests are not allowed.";
+    }
+    if (originHost !== (req.headers.host ?? "").toLowerCase()) return "Cross-origin requests are not allowed.";
+  }
+  // A JSON content type forces a CORS preflight for any cross-site caller.
+  if (!/^application\/json\b/i.test(req.headers["content-type"] ?? "")) return "Send JSON with Content-Type: application/json.";
+  return undefined;
+}
 
 function readJson<T>(req: IncomingMessage): Promise<T> {
   return new Promise((resolve, reject) => {
@@ -271,6 +303,8 @@ export async function startStudioServer(options: StudioOptions) {
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${options.host}:${options.port}`);
     try {
+      const rejection = rejectForeignRequest(req, options.host);
+      if (rejection) return void sendJson(res, 403, { error: rejection });
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
         res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
         res.end(page);
