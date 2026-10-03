@@ -1,6 +1,6 @@
 {
   "name": "feedletter",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Turn an RSS feed or Markdown folder into a newsletter: curate in a browser studio and send with SMTPfast.",
   "type": "module",
   "bin": {
