@@ -89,12 +89,15 @@ export function isLoopbackHost(host: string) {
  * address (127.1 and 2130706433 do), or it cannot be resolved (fail closed).
  * Binding to a non-loopback address such as 0.0.0.0 is an explicit opt-in.
  */
-export async function bindNeedsHostGuard(bindHost: string): Promise<boolean> {
+export async function bindNeedsHostGuard(
+  bindHost: string,
+  resolve: (host: string, options: { all: true }) => Promise<Array<{ address: string }>> = lookup,
+): Promise<boolean> {
   const host = normalizeHost(bindHost);
   if (isLoopbackHost(host)) return true;
   if (isIP(host)) return false;
   try {
-    const addresses = await lookup(host, { all: true });
+    const addresses = await resolve(host, { all: true });
     return addresses.length === 0 || addresses.some((entry) => isLoopbackHost(entry.address));
   } catch {
     return true;
