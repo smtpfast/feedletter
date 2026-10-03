@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { HistoryStore } from "./history.js";
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -34,7 +35,8 @@ function startMock(): Promise<Server> {
       if (req.method === "POST" && req.url === "/v1/emails/batch") {
         const rows = body as Array<{ subject?: string }>;
         const reply = () => json(200, { batch_id: "b1", emails: rows.map((_, i) => ({ id: `email_${i}`, status: "queued" })) });
-        // "Slow" lets a test hold a send open while a second one arrives.
+        // "Slow" lets a test hold a send open while a second one arrives; "Flaky" fails after queueing.
+        if (rows[0]?.subject === "Flaky") return json(500, { error: "Internal error" });
         return rows[0]?.subject === "Slow" ? void setTimeout(reply, 300) : reply();
       }
       if (req.method === "GET" && req.url?.startsWith("/v1/broadcasts/audience")) {
@@ -261,6 +263,49 @@ describe("studio server", () => {
     expect(received.filter((r) => r.url?.endsWith("/send"))).toHaveLength(1);
   });
 
+  it("stops instead of creating a new campaign when the saved broadcast was canceled", async () => {
+    received.length = 0;
+    const body = { apiKey: "k", from: "news@example.com", draft: { ...draft, title: "Canceled" }, baseUrl: mockUrl };
+    const saved = await post("/api/broadcast", body);
+    broadcasts.get(String(saved.data.id))!.status = "canceled";
+
+    const retry = await post("/api/broadcast", { ...body, send: true });
+    expect(retry.status).toBe(409);
+    expect(String(retry.data.error)).toMatch(/was canceled; some contacts may already have it/);
+    expect(received.filter((r) => r.method === "POST" && r.url === "/v1/broadcasts")).toHaveLength(1);
+    expect(received.some((r) => r.url?.endsWith("/send"))).toBe(false);
+  });
+
+  it("reports a 5xx batch as uncertain and skips those addresses on a rerun", async () => {
+    const body = { apiKey: "k", from: "news@example.com", recipients: "f1@x.com", draft: { ...draft, title: "Flaky" }, baseUrl: mockUrl };
+    expect((await post("/api/send", body)).data).toMatchObject({ sent: 0, uncertain: 1, failed: 0 });
+    received.length = 0;
+    expect((await post("/api/send", body)).data).toMatchObject({ sent: 0, uncertain: 1 });
+    expect(received.some((r) => r.url === "/v1/emails/batch")).toBe(false);
+  });
+
+  it("refuses to send while another process holds the history lock", async () => {
+    const historyDb = path.join(contentDir, "locked.sqlite");
+    const second = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
+    const other = await HistoryStore.open(historyDb);
+    let release!: () => void;
+    const holding = other.exclusive(() => new Promise<void>((resolve) => (release = resolve)));
+    try {
+      const res = await fetch(`http://127.0.0.1:${(second.address() as AddressInfo).port}/api/send`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ apiKey: "k", from: "news@example.com", recipients: "l@x.com", draft: { ...draft, title: "Locked" }, baseUrl: mockUrl }),
+      });
+      expect(res.status).toBe(409);
+      expect(String(((await res.json()) as { error: string }).error)).toMatch(/Another feedletter send is using/);
+    } finally {
+      release();
+      await holding;
+      other.close();
+      await new Promise<void>((r) => second.close(() => r()));
+    }
+  });
+
   it("explains a failed audience lookup", async () => {
     const { status, data } = await post("/api/audience", { apiKey: "k", baseUrl: `${mockUrl}/missing` });
     expect(status).toBe(502);
@@ -325,7 +370,34 @@ describe("studio send guard", () => {
     finish(): void;
     busy(): string | null;
   };
-  const createSendGuard = new Function(`${SEND_GUARD_SOURCE}\nreturn createSendGuard;`)() as () => Guard;
+  const { createSendGuard, createAudienceTracker } = new Function(
+    `${SEND_GUARD_SOURCE}\nreturn { createSendGuard, createAudienceTracker };`,
+  )() as {
+    createSendGuard: () => Guard;
+    createAudienceTracker: () => {
+      change(): number;
+      begin(): number;
+      settle(token: number, value: unknown): boolean;
+      fail(token: number): boolean;
+      current(): unknown;
+      loading(): boolean;
+      version(): number;
+    };
+  };
+
+  it("ignores an audience answer that arrives after the key or segment changed", () => {
+    const audience = createAudienceTracker();
+    const oldKeyLookup = audience.begin();
+    audience.change();
+    // The answer for the old key lands during the debounce for the new key.
+    expect(audience.settle(oldKeyLookup, { eligible: 1261 })).toBe(false);
+    expect(audience.current()).toBeNull();
+    expect(audience.loading()).toBe(false);
+
+    const lookup = audience.begin();
+    expect(audience.settle(lookup, { eligible: 96 })).toBe(true);
+    expect(audience.current()).toEqual({ eligible: 96 });
+  });
 
   it("needs two presses for the same audience", () => {
     const guard = createSendGuard();

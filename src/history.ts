@@ -1,8 +1,8 @@
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, open, readFile, rename, rm, stat, writeFile } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import path from "node:path";
-import initSqlJs, { type Database } from "sql.js";
+import initSqlJs, { type Database, type SqlJsStatic } from "sql.js";
 import type { DigestIssue, SourceItem } from "./types.js";
 
 const require = createRequire(import.meta.url);
@@ -18,10 +18,23 @@ function issueHistoryKey(issue: DigestIssue) {
     .digest("hex");
 }
 
+/** Whether a recipient was accepted by SMTPfast, or a batch failed in a way that may have sent it. */
+export type RecipientState = "sent" | "uncertain";
+
+function processAlive(pid: number) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
 export class HistoryStore {
   private constructor(
     private readonly dbPath: string,
-    private readonly db: Database,
+    private readonly SQL: SqlJsStatic,
+    private db: Database,
   ) {}
 
   static async open(dbPath: string) {
@@ -37,10 +50,60 @@ export class HistoryStore {
       db = new SQL.Database();
     }
 
-    const store = new HistoryStore(dbPath, db);
+    const store = new HistoryStore(dbPath, SQL, db);
     store.migrate();
     await store.persist();
     return store;
+  }
+
+  /**
+   * Run fn while holding an exclusive lock file next to the history file, after
+   * re-reading the file, so two processes cannot send at once or overwrite
+   * each other's progress. The lock holds the pid; a lock whose process is gone
+   * is stale and is taken over.
+   */
+  async exclusive<T>(fn: () => Promise<T>): Promise<T> {
+    const lockPath = `${this.dbPath}.lock`;
+    let acquired = false;
+    for (let attempt = 0; attempt < 2 && !acquired; attempt++) {
+      try {
+        const handle = await open(lockPath, "wx");
+        await handle.writeFile(`${process.pid}\n`);
+        await handle.close();
+        acquired = true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        const pid = Number.parseInt((await readFile(lockPath, "utf8").catch(() => "")).trim(), 10);
+        const young = await stat(lockPath).then((info) => Date.now() - info.mtimeMs < 5000, () => false);
+        if (Number.isInteger(pid) && pid > 0 ? processAlive(pid) : young) {
+          throw new Error(
+            `Another feedletter send is using ${this.dbPath}${Number.isInteger(pid) ? ` (process ${pid})` : ""}. Wait for it to finish. If no send is running, delete ${lockPath}.`,
+          );
+        }
+        await rm(lockPath, { force: true });
+      }
+    }
+    if (!acquired) throw new Error(`Could not lock ${this.dbPath}. If no send is running, delete ${lockPath}.`);
+    try {
+      await this.reload();
+      return await fn();
+    } finally {
+      await rm(lockPath, { force: true });
+    }
+  }
+
+  /** Re-read the history file, to see what another process wrote. */
+  async reload() {
+    let data: Buffer;
+    try {
+      data = await readFile(this.dbPath);
+    } catch {
+      return;
+    }
+    const next = new this.SQL.Database(data);
+    this.db.close();
+    this.db = next;
+    this.migrate();
   }
 
   seenKeys(items: SourceItem[]) {
@@ -88,27 +151,30 @@ export class HistoryStore {
     await this.persist();
   }
 
-  /** Lowercased addresses SMTPfast already accepted for this exact send (see sendKey). */
+  /** Lowercased addresses an earlier run of this exact send (see sendKey) sent, or may have sent. */
   sentRecipients(sendKey: string) {
-    const sent = new Set<string>();
-    const stmt = this.db.prepare("SELECT recipient FROM sent_recipients WHERE send_key = ?");
+    const sent = new Map<string, RecipientState>();
+    const stmt = this.db.prepare("SELECT recipient, state FROM sent_recipients WHERE send_key = ?");
     try {
       stmt.bind([sendKey]);
-      while (stmt.step()) sent.add(String(stmt.get()[0]));
+      while (stmt.step()) {
+        const [recipient, state] = stmt.get();
+        sent.set(String(recipient), state === "uncertain" ? "uncertain" : "sent");
+      }
     } finally {
       stmt.free();
     }
     return sent;
   }
 
-  /** Save addresses from an accepted batch, so a rerun of the same send skips them. */
-  async recordRecipients(sendKey: string, rows: Array<{ recipient: string; id?: string }>) {
+  /** Save the addresses of one batch, so a rerun of the same send skips them. */
+  async recordRecipients(sendKey: string, rows: Array<{ recipient: string; id?: string }>, state: RecipientState = "sent") {
     const stmt = this.db.prepare(
-      "INSERT OR IGNORE INTO sent_recipients (send_key, recipient, email_id, sent_at) VALUES (?, ?, ?, ?)",
+      "INSERT OR REPLACE INTO sent_recipients (send_key, recipient, email_id, sent_at, state) VALUES (?, ?, ?, ?, ?)",
     );
     const now = new Date().toISOString();
     try {
-      for (const row of rows) stmt.run([sendKey, row.recipient.toLowerCase(), row.id ?? null, now]);
+      for (const row of rows) stmt.run([sendKey, row.recipient.toLowerCase(), row.id ?? null, now, state]);
     } finally {
       stmt.free();
     }
@@ -164,6 +230,7 @@ export class HistoryStore {
         recipient TEXT NOT NULL,
         email_id TEXT,
         sent_at TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'sent',
         PRIMARY KEY (send_key, recipient)
       );
 
@@ -179,7 +246,9 @@ export class HistoryStore {
   }
 
   private async persist() {
-    const data = this.db.export();
-    await writeFile(this.dbPath, Buffer.from(data));
+    // Write a temp file and rename it, so a crash never leaves half a database.
+    const temp = `${this.dbPath}.${process.pid}.tmp`;
+    await writeFile(temp, Buffer.from(this.db.export()));
+    await rename(temp, this.dbPath);
   }
 }

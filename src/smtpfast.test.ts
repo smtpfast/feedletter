@@ -9,7 +9,7 @@ import {
   BROADCAST_HTML_LIMIT,
   checkRecipients,
   createBroadcast,
-  createBroadcastOnce,
+  checkSavedBroadcast,
   findSegment,
   getAudience,
   parseRecipients,
@@ -95,35 +95,61 @@ describe("sendDigest", () => {
     expect(results.filter((r) => r.ok)).toHaveLength(250);
   });
 
-  it("resumes after a partial failure without resending accepted batches", async () => {
+  async function withStore(fn: (store: HistoryStore) => Promise<void>) {
     const dir = await mkdtemp(path.join(tmpdir(), "feedletter-checkpoint-"));
     const store = await HistoryStore.open(path.join(dir, "history.sqlite"));
     try {
-      const key = sendKey(message);
-      const checkpoint = (): SendCheckpoint => ({ alreadySent: store.sentRecipients(key), record: (rows) => store.recordRecipients(key, rows) });
-      const recipients = Array.from({ length: 150 }, (_, i) => `user${i}@example.com`);
-
-      // First run: batch 1 is accepted, batch 2 fails.
-      mockApi((call, index) => (index === 0 ? okBatch(call) : { status: 500, body: { error: "Internal error" } }));
-      const first = await sendDigest(config, message, recipients, { checkpoint: checkpoint() });
-      expect(first.filter((r) => r.ok)).toHaveLength(100);
-      expect(first.filter((r) => !r.ok)).toHaveLength(50);
-
-      // Rerun: only the 50 that failed go out.
-      mockApi(okBatch);
-      const second = await sendDigest(config, message, recipients, { checkpoint: checkpoint() });
-      expect(calls).toHaveLength(1);
-      expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients.slice(100));
-      expect(second.filter((r) => r.alreadySent)).toHaveLength(100);
-      expect(second.filter((r) => r.ok)).toHaveLength(50);
-
-      // Different content is a different send, so nobody is skipped.
-      const edited = sendKey({ ...message, subject: "Hi again" });
-      expect(store.sentRecipients(edited).size).toBe(0);
+      await fn(store);
     } finally {
       store.close();
       await rm(dir, { recursive: true, force: true });
     }
+  }
+  const checkpointFor = (store: HistoryStore, resend = false): SendCheckpoint => {
+    const key = sendKey(message);
+    return { previous: resend ? new Map() : store.sentRecipients(key), record: (rows, state) => store.recordRecipients(key, rows, state) };
+  };
+  const recipients150 = Array.from({ length: 150 }, (_, i) => `user${i}@example.com`);
+
+  it("resends only the refused batch on a rerun after a 4xx", async () => {
+    await withStore(async (store) => {
+      // SMTPfast refuses with a 4xx before it queues anything.
+      mockApi((call, index) => (index === 0 ? okBatch(call) : { status: 403, body: { error: "Item 0: domain example.com is not verified" } }));
+      const first = await sendDigest(config, message, recipients150, { checkpoint: checkpointFor(store) });
+      expect(first.filter((r) => r.ok)).toHaveLength(100);
+      expect(first.filter((r) => r.uncertain)).toHaveLength(0);
+
+      mockApi(okBatch);
+      const second = await sendDigest(config, message, recipients150, { checkpoint: checkpointFor(store) });
+      expect(calls).toHaveLength(1);
+      expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients150.slice(100));
+      expect(second.filter((r) => r.alreadySent)).toHaveLength(100);
+      expect(second.filter((r) => r.ok)).toHaveLength(50);
+      expect(store.sentRecipients(sendKey({ ...message, subject: "Hi again" })).size).toBe(0);
+    });
+  });
+
+  it("marks a batch that ended in a 5xx as uncertain, stops, and skips it on a rerun", async () => {
+    await withStore(async (store) => {
+      const recipients = Array.from({ length: 250 }, (_, i) => `user${i}@example.com`);
+      mockApi((call, index) => (index === 0 ? okBatch(call) : { status: 500, body: { error: "Internal error" } }));
+      const first = await sendDigest(config, message, recipients, { checkpoint: checkpointFor(store) });
+      expect(calls).toHaveLength(2);
+      expect(first.filter((r) => r.ok)).toHaveLength(100);
+      expect(first.filter((r) => r.uncertain)).toHaveLength(100);
+      expect(first.filter((r) => /stopped after a batch with an unknown outcome/.test(r.error ?? ""))).toHaveLength(50);
+
+      // The rerun sends only the 50 that never went out; the uncertain 100 are skipped.
+      mockApi(okBatch);
+      const second = await sendDigest(config, message, recipients, { checkpoint: checkpointFor(store) });
+      expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients.slice(200));
+      expect(second.filter((r) => r.uncertain)).toHaveLength(100);
+
+      // --resend sends to everyone.
+      mockApi(okBatch);
+      await sendDigest(config, message, recipients, { checkpoint: checkpointFor(store, true) });
+      expect(calls.reduce((sum, call) => sum + (call.body as unknown[]).length, 0)).toBe(250);
+    });
   });
 
   it("skips invalid addresses and reports suppressed rows", async () => {
@@ -164,7 +190,8 @@ describe("sendDigest", () => {
     const results = await sendDigest(config, message, recipients);
     expect(calls).toHaveLength(1);
     expect(results[0].error).toMatch(/not verified \(403\)/);
-    expect(results[149].error).toBe("not sent: an earlier batch failed");
+    expect(results[0].uncertain).toBeUndefined();
+    expect(results[149].error).toBe("not sent: an earlier batch was refused");
   });
 
   it("does not replay a batch when the connection drops after it was sent", async () => {
@@ -184,17 +211,18 @@ describe("sendDigest", () => {
       const local = { apiKey: "k", baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
       expect((await sendDigest(local, message, ["a@example.com"]))[0].ok).toBe(true);
       const [dropped] = await sendDigest(local, { ...message, subject: "Second" }, ["b@example.com"]);
-      expect(dropped.error).toMatch(/may have been queued/);
+      expect(dropped).toMatchObject({ ok: false, uncertain: true });
       expect(batches).toBe(2);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
-  it("warns that a batch with no answer may still have been queued", async () => {
+  it("marks a batch with no answer as uncertain", async () => {
     mockApi(() => new TypeError("socket hang up"));
     const [result] = await sendDigest(config, message, ["a@example.com"]);
-    expect(result.error).toMatch(/may have been queued/);
+    expect(result).toMatchObject({ ok: false, uncertain: true });
+    expect(result.error).toMatch(/may have sent some of this batch/);
   });
 });
 
@@ -265,15 +293,35 @@ describe("broadcasts", () => {
     await expect(sendBroadcastChecked(config, "bc_1")).rejects.toThrow(/was not sent \(status: draft\).*broadcasts\/bc_1/);
   });
 
-  it("finds the draft SMTPfast created when the create answer was lost", async () => {
-    mockApi((call) =>
-      call.method === "POST"
-        ? new TypeError("socket hang up")
-        : { body: { object: "list", data: [{ id: "bc_9", name: "Weekly", subject: "Hi", created_at: new Date().toISOString() }] } },
-    );
-    const draft = await createBroadcastOnce(config, { name: "Weekly", from: "news@example.com", subject: "Hi", html: "<p>{{unsubscribe_url}}</p>" });
-    expect(draft.id).toBe("bc_9");
-    expect(calls[1].url).toContain("/v1/broadcasts?status=draft");
+  it("does not report a failed or canceled broadcast as sent", async () => {
+    mockApi((call) => (call.url.endsWith("/send") ? new TypeError("socket hang up") : { body: { id: "bc_1", status: "failed" } }));
+    await expect(sendBroadcastChecked(config, "bc_1")).rejects.toThrow(/status "failed"; some contacts may have it/);
+  });
+
+  it("stops when the answer to a create is lost, and never looks for a draft by name", async () => {
+    mockApi(() => new TypeError("socket hang up"));
+    await expect(
+      createBroadcast(config, { name: "Weekly", from: "news@example.com", subject: "Hi", html: "<p>{{unsubscribe_url}}</p>" }),
+    ).rejects.toThrow(/may have created the draft anyway. Check your broadcasts/);
+    expect(calls.map((c) => c.method)).toEqual(["POST"]);
+  });
+
+  it("decides what to do with a saved broadcast from its status", async () => {
+    const status = (value: string, code = 200) => mockApi(() => (code === 200 ? { body: { id: "bc_1", status: value } } : { status: code, body: { error: "Broadcast not found" } }));
+    status("draft");
+    expect(await checkSavedBroadcast(config, "bc_1")).toEqual({ action: "reuse", id: "bc_1" });
+    status("", 404);
+    expect(await checkSavedBroadcast(config, "bc_1")).toEqual({ action: "create" });
+    for (const sent of ["scheduled", "queued", "sending", "sent", "paused"]) {
+      status(sent);
+      expect(await checkSavedBroadcast(config, "bc_1")).toMatchObject({ action: "stop", message: expect.stringMatching(/already went out/) });
+    }
+    for (const partial of ["failed", "canceled"]) {
+      status(partial);
+      expect(await checkSavedBroadcast(config, "bc_1")).toMatchObject({ action: "stop", message: expect.stringMatching(/some contacts may already have it/) });
+    }
+    status("archived");
+    expect(await checkSavedBroadcast(config, "bc_1")).toMatchObject({ action: "stop", message: expect.stringMatching(/cannot tell/) });
   });
 
   it("creates a draft for a segment and links to it", async () => {
@@ -283,11 +331,12 @@ describe("broadcasts", () => {
     expect(draft.url).toBe("https://smtpfa.st/broadcasts/bc_1");
   });
 
-  it("refuses HTML over the broadcast limit before calling the API", async () => {
+  it("refuses HTML over the broadcast limit before calling the API, with no recovery", async () => {
     mockApi(() => ({ body: {} }));
-    await expect(
-      createBroadcast(config, { name: "n", from: "a@example.com", subject: "s", html: "x".repeat(BROADCAST_HTML_LIMIT + 1) }),
-    ).rejects.toThrow(/fewer items/);
+    const attempt = createBroadcast(config, { name: "n", from: "a@example.com", subject: "s", html: "x".repeat(BROADCAST_HTML_LIMIT + 1) });
+    await expect(attempt).rejects.toThrow(/fewer items/);
+    await expect(attempt).rejects.not.toThrow(/may have created/);
+    await expect(attempt).rejects.toMatchObject({ noAnswer: false });
     expect(calls).toHaveLength(0);
   });
 

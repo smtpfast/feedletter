@@ -137,7 +137,7 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
 | `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
 | `--test` | off | Send only to the first recipient and do not record history. |
-| `--resend` | off | Send to every recipient, even ones an earlier run of this exact issue reached. |
+| `--resend` | off | Send to every recipient, even ones an earlier run of this exact issue reached or may have reached. |
 | `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items and send progress. |
 | `--no-history` | history enabled | Do not record sent items or send progress. |
 
@@ -262,17 +262,27 @@ suppressed (unsubscribed, bounced, or complained before) as skipped, not
 failed, so a scheduled job does not fail when a subscriber leaves. A 429 rate
 limit is retried after `Retry-After`, up to three times.
 
-Reruns are safe:
+Reruns never send the same email twice. When Feedletter cannot tell what
+happened, it stops and says so:
 
-- `send` records each batch SMTPfast accepts in the history file. If a later
-  batch fails, run the same command again: it skips the addresses that already
-  got this exact issue and sends to the rest. Change the issue, or pass
-  `--resend`, to send to everyone again. The batch API has no idempotency key,
-  so with `--no-history` a rerun sends to everyone.
-- `broadcast` records the id of the broadcast it creates. A rerun reuses that
-  draft, and if SMTPfast shows the broadcast as already sent, it stops instead
-  of creating a second one. If the answer to a send is lost, Feedletter reads
-  the broadcast's status before it reports a failure.
+- `send` records each batch in the history file. SMTPfast refuses a batch with
+  a 4xx before it queues anything, so a refused batch counts as not sent. A 5xx
+  or a lost answer can be a partial send: those addresses are recorded as
+  uncertain, the send stops, and the count is printed. Run the same command
+  again to send to the rest: it skips addresses that already got this exact
+  issue and the uncertain ones. Check the SMTPfast logs, then use `--resend`
+  only if they did not get it. With `--no-history` there is no record, so a
+  rerun sends to everyone.
+- `broadcast` records the id of the broadcast it creates and reuses it only
+  while it is a draft. If SMTPfast shows it as sent, sending, or scheduled, a
+  rerun stops. If it was canceled or failed, some contacts may already have it,
+  so a rerun also stops; `--resend` creates a new broadcast. If the answer to a
+  send is lost, Feedletter reads the broadcast's status before it reports. If
+  the answer to creating a draft is lost, it stops and asks you to check your
+  broadcasts in SMTPfast.
+- A send holds a lock file next to the history file (`<history>.lock`), so two
+  processes that share it cannot send at once. A lock left by a process that
+  is no longer running is taken over.
 
 ## History Tracking
 

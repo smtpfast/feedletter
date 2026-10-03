@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { mkdtemp, rm } from "node:fs/promises";
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { HistoryStore, itemHistoryKey } from "./history.js";
@@ -57,3 +57,48 @@ describe("HistoryStore", () => {
     expect(a).toBe(b);
   });
 });
+
+describe("HistoryStore send lock", () => {
+  it("refuses a second send while another holds the lock", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const a = await HistoryStore.open(dbPath);
+    const b = await HistoryStore.open(dbPath);
+    let release!: () => void;
+    const holding = a.exclusive(() => new Promise<void>((resolve) => (release = resolve)));
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    await expect(b.exclusive(async () => "sent")).rejects.toThrow(/Another feedletter send is using .*process \d+/);
+    release();
+    await holding;
+    await expect(b.exclusive(async () => "sent")).resolves.toBe("sent");
+    a.close();
+    b.close();
+  });
+
+  it("takes over a lock whose process is gone, and removes it afterwards", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath);
+    await writeFile(`${dbPath}.lock`, "2147483646\n");
+    await expect(store.exclusive(async () => "ok")).resolves.toBe("ok");
+    await expect(access(`${dbPath}.lock`)).rejects.toThrow();
+    store.close();
+  });
+
+  it("keeps both processes' progress instead of overwriting it", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    // Both open before either writes, like a running studio and a CLI send.
+    const a = await HistoryStore.open(dbPath);
+    const b = await HistoryStore.open(dbPath);
+    await a.exclusive(() => a.recordRecipients("key", [{ recipient: "one@example.com" }]));
+    await b.exclusive(() => b.recordRecipients("key", [{ recipient: "two@example.com" }], "uncertain"));
+    a.close();
+    b.close();
+
+    const reopened = await HistoryStore.open(dbPath);
+    expect([...reopened.sentRecipients("key")].sort()).toEqual([
+      ["one@example.com", "sent"],
+      ["two@example.com", "uncertain"],
+    ]);
+    reopened.close();
+  });
+});
+

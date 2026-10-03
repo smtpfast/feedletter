@@ -8,19 +8,18 @@ import { HistoryStore, itemHistoryKey } from "./history.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
 import {
-  BROADCAST_SENT_STATUSES,
   broadcastUrl,
   checkRecipients,
-  createBroadcastOnce,
+  checkSavedBroadcast,
+  createBroadcast,
   getAudience,
-  getBroadcast,
   parseRecipients,
   sendBroadcastChecked,
   sendDigest,
   sendKey,
-  SmtpfastError,
   verifyFromDomain,
   type SendCheckpoint,
+  type SendResult,
   SMTPFAST_DEFAULT_BASE_URL,
   SMTPFAST_SIGNUP_URL,
   UNSUBSCRIBE_PLACEHOLDER,
@@ -49,7 +48,7 @@ interface ServerContext extends StudioOptions {
   /** A list send or broadcast is running; a second one is refused until it ends. */
   sending?: boolean;
   /** Send progress when there is no history store, kept for this process only. */
-  memorySent: Map<string, Set<string>>;
+  memorySent: Map<string, Map<string, "sent" | "uncertain">>;
   memoryBroadcasts: Map<string, string>;
 }
 
@@ -334,13 +333,31 @@ function renderSendable(body: Record<string, unknown>) {
 
 const BUSY_MESSAGE = "Another send is still running. Wait for it to finish, then try again.";
 
-/** Accepted addresses for one exact send: in the history DB, or in memory with --no-history. */
+/** Progress of one exact send: in the history DB, or in memory with --no-history. */
 function checkpointFor(ctx: ServerContext, key: string): SendCheckpoint {
   const store = ctx.historyStore;
-  if (store) return { alreadySent: store.sentRecipients(key), record: (rows) => store.recordRecipients(key, rows) };
-  const sent = ctx.memorySent.get(key) ?? new Set<string>();
+  if (store) return { previous: store.sentRecipients(key), record: (rows, state) => store.recordRecipients(key, rows, state) };
+  const sent = ctx.memorySent.get(key) ?? new Map<string, "sent" | "uncertain">();
   ctx.memorySent.set(key, sent);
-  return { alreadySent: new Set(sent), record: (rows) => rows.forEach((row) => sent.add(row.recipient.toLowerCase())) };
+  return { previous: new Map(sent), record: (rows, state) => rows.forEach((row) => sent.set(row.recipient.toLowerCase(), state)) };
+}
+
+/**
+ * Run a send with the studio's one-at-a-time flag set and, with history on,
+ * the history file's lock held (another process may be sending with it).
+ */
+async function exclusiveSend<T>(ctx: ServerContext, fn: () => Promise<T>): Promise<T> {
+  ctx.sending = true;
+  try {
+    return ctx.historyStore ? await ctx.historyStore.exclusive(fn) : await fn();
+  } finally {
+    ctx.sending = false;
+  }
+}
+
+function lockMessage(error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^Another feedletter send is using|^Could not lock/.test(message) ? message : undefined;
 }
 
 async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
@@ -362,26 +379,33 @@ async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: Server
   if (checked.valid.length === 0) {
     return sendJson(res, 400, { error: `No valid addresses to send to: ${checked.invalid.slice(0, 5).join(", ")}` });
   }
-  if (!isTest && ctx.sending) return sendJson(res, 409, { error: BUSY_MESSAGE });
 
   const message = { from, subject: email.subject, html: email.html, text: email.text };
-  if (!isTest) ctx.sending = true;
-  try {
-    // A rerun of this exact send skips addresses an earlier run already reached.
-    const checkpoint = isTest ? undefined : checkpointFor(ctx, sendKey(message));
-    const results = await sendDigest(config, message, checked.valid, { checkpoint });
-    for (const recipient of checked.invalid) results.push({ recipient, ok: false, error: "not a valid email address" });
-    const sent = results.filter((r) => r.ok).length;
-    const skipped = results.filter((r) => r.suppressed).length;
-    const alreadySent = results.filter((r) => r.alreadySent).length;
-
-    // Test sends never touch history.
-    if (!isTest && sent + alreadySent > 0) await recordSent(ctx, email.subject, email.items, email.sourceLabel);
-
-    return sendJson(res, 200, { sent, skipped, alreadySent, failed: results.length - sent - skipped - alreadySent, results });
-  } finally {
-    if (!isTest) ctx.sending = false;
+  let results: SendResult[];
+  if (isTest) {
+    // Test sends skip the checkpoint and never touch history.
+    results = await sendDigest(config, message, checked.valid);
+  } else {
+    if (ctx.sending) return sendJson(res, 409, { error: BUSY_MESSAGE });
+    try {
+      results = await exclusiveSend(ctx, async () => {
+        // A rerun of this exact send skips addresses an earlier run reached, or may have.
+        const out = await sendDigest(config, message, checked.valid, { checkpoint: checkpointFor(ctx, sendKey(message)) });
+        if (out.some((r) => r.ok || r.alreadySent)) await recordSent(ctx, email.subject, email.items, email.sourceLabel);
+        return out;
+      });
+    } catch (error) {
+      const locked = lockMessage(error);
+      if (locked) return sendJson(res, 409, { error: locked });
+      throw error;
+    }
   }
+  for (const recipient of checked.invalid) results.push({ recipient, ok: false, error: "not a valid email address" });
+  const sent = results.filter((r) => r.ok).length;
+  const skipped = results.filter((r) => r.suppressed).length;
+  const alreadySent = results.filter((r) => r.alreadySent).length;
+  const uncertain = results.filter((r) => r.uncertain).length;
+  return sendJson(res, 200, { sent, skipped, alreadySent, uncertain, failed: results.length - sent - skipped - alreadySent - uncertain, results });
 }
 
 async function handleAudience(req: IncomingMessage, res: ServerResponse) {
@@ -412,54 +436,45 @@ async function handleBroadcast(req: IncomingMessage, res: ServerResponse, ctx: S
 
   const key = `broadcast:${segmentId ?? "all"}:${sendKey({ from, subject: email.subject, html: email.html, text: email.text })}`;
   let broadcastId: string | undefined;
-  ctx.sending = true;
   try {
-    // Reuse the broadcast created for this exact email, so a retry after a lost
-    // answer never creates (or sends) a second campaign.
-    broadcastId = ctx.memoryBroadcasts.get(key) ?? ctx.historyStore?.broadcastFor(key);
-    if (broadcastId) {
-      let existing;
-      try {
-        existing = await getBroadcast(config, broadcastId);
-      } catch (error) {
-        if (!(error instanceof SmtpfastError && error.status === 404)) throw error;
+    return await exclusiveSend(ctx, async () => {
+      // Only a draft created earlier for this exact email is reused. Anything
+      // that may have reached contacts stops instead of creating a second campaign.
+      const savedId = ctx.memoryBroadcasts.get(key) ?? ctx.historyStore?.broadcastFor(key);
+      if (savedId) {
+        const decision = await checkSavedBroadcast(config, savedId);
+        if (decision.action === "stop") {
+          return sendJson(res, 409, { error: `${decision.message} Change the email to send a new broadcast.`, url: decision.url, broadcastId: savedId });
+        }
+        if (decision.action === "reuse") broadcastId = decision.id;
       }
-      if (existing && BROADCAST_SENT_STATUSES.has(existing.status)) {
-        return sendJson(res, 409, {
-          error: `This email already went out as a broadcast (${existing.status}). Change it to send again.`,
-          url: existing.url,
-          broadcastId,
+      const reused = Boolean(broadcastId);
+      if (!broadcastId) {
+        const draft = await createBroadcast(config, {
+          name: toStringField(body.name).trim() || email.subject,
+          from,
+          subject: email.subject,
+          previewText: email.preheader,
+          html: email.html,
+          text: email.text,
+          segmentId,
         });
+        broadcastId = draft.id;
+        ctx.memoryBroadcasts.set(key, draft.id);
+        await ctx.historyStore?.recordBroadcast(key, draft.id);
       }
-      if (existing?.status !== "draft") broadcastId = undefined;
-    }
-    const reused = Boolean(broadcastId);
-    if (!broadcastId) {
-      const draft = await createBroadcastOnce(config, {
-        name: toStringField(body.name).trim() || email.subject,
-        from,
-        subject: email.subject,
-        previewText: email.preheader,
-        html: email.html,
-        text: email.text,
-        segmentId,
-      });
-      broadcastId = draft.id;
-      ctx.memoryBroadcasts.set(key, draft.id);
-      await ctx.historyStore?.recordBroadcast(key, draft.id);
-    }
-    if (!sendNow) return sendJson(res, 200, { id: broadcastId, status: "draft", url: broadcastUrl(broadcastId), reused });
+      if (!sendNow) return sendJson(res, 200, { id: broadcastId, status: "draft", url: broadcastUrl(broadcastId), reused });
 
-    const sent = await sendBroadcastChecked(config, broadcastId);
-    await recordSent(ctx, email.subject, email.items, email.sourceLabel);
-    return sendJson(res, 200, sent);
+      const sent = await sendBroadcastChecked(config, broadcastId);
+      await recordSent(ctx, email.subject, email.items, email.sourceLabel);
+      return sendJson(res, 200, sent);
+    });
   } catch (error) {
-    return sendJson(res, 502, {
-      error: error instanceof Error ? error.message : String(error),
+    const locked = lockMessage(error);
+    return sendJson(res, locked ? 409 : 502, {
+      error: locked ?? (error instanceof Error ? error.message : String(error)),
       ...(broadcastId ? { url: broadcastUrl(broadcastId), broadcastId } : {}),
     });
-  } finally {
-    ctx.sending = false;
   }
 }
 

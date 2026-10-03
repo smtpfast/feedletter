@@ -10,18 +10,16 @@ import { startPreviewServer } from "./preview.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
 import {
-  BROADCAST_SENT_STATUSES,
   broadcastUrl,
   checkRecipients,
-  createBroadcastOnce,
+  checkSavedBroadcast,
+  createBroadcast,
   findSegment,
   getAudience,
-  getBroadcast,
   parseRecipients,
   sendBroadcastChecked,
   sendDigest,
   sendKey,
-  SmtpfastError,
   SMTPFAST_DEFAULT_BASE_URL,
   UNSUBSCRIBE_PLACEHOLDER,
   type SendCheckpoint,
@@ -55,7 +53,7 @@ async function readIssue(dir: string): Promise<DigestIssue> {
 }
 
 function plural(count: number, word: string) {
-  return `${count.toLocaleString("en")} ${word}${count === 1 ? "" : "s"}`;
+  return `${count.toLocaleString("en")} ${word}${count === 1 ? "" : word.endsWith("s") ? "es" : "s"}`;
 }
 
 program
@@ -156,7 +154,8 @@ program
       await writeOutputFile(outDir, "issue.json", `${JSON.stringify(issue, null, 2)}\n`);
 
       if (history && options.recordHistory) {
-        await history.recordIssue(issue);
+        const store = history;
+        await store.exclusive(() => store.recordIssue(issue));
       }
 
       const skippedText = skippedSeenCount ? ` (${skippedSeenCount} previously included item${skippedSeenCount === 1 ? "" : "s"} skipped)` : "";
@@ -240,7 +239,7 @@ program
   .option("--api-key <key>", "SMTPfast API key (defaults to SMTPFAST_API_KEY)")
   .option("--api-url <url>", "SMTPfast API base URL", process.env.SMTPFAST_API_URL ?? SMTPFAST_DEFAULT_BASE_URL)
   .option("--test", "Send only to the first recipient and skip history")
-  .option("--resend", "Send to every recipient, even ones an earlier run of this exact issue reached")
+  .option("--resend", "Send to every recipient, even ones an earlier run of this exact issue reached or may have reached")
   .option("--history-db <path>", "SQLite file used to record sent items and send progress", ".feedletter/feedletter.sqlite")
   .option("--no-history", "Do not record sent items or send progress")
   .action(async (options) => {
@@ -281,35 +280,46 @@ program
       const text = renderText(sendable);
       const message = { from: options.from, subject: issue.title, html, text };
 
-      // The batch endpoint has no idempotency: if a later batch fails, a rerun
-      // would resend the earlier ones. The checkpoint records accepted
-      // addresses after each batch so a rerun of this exact send skips them.
-      let checkpoint: SendCheckpoint | undefined;
+      const config = { apiKey, baseUrl: options.apiUrl };
+      let results;
       if (options.history && !options.test) {
+        // The batch endpoint has no idempotency, so progress is recorded after
+        // each batch and a rerun of this exact send skips those addresses. The
+        // lock stops two processes from sending with the same history file.
         history = await HistoryStore.open(path.resolve(options.historyDb));
         const store = history;
         const key = sendKey(message);
-        checkpoint = {
-          alreadySent: options.resend ? new Set() : store.sentRecipients(key),
-          record: (accepted) => store.recordRecipients(key, accepted),
-        };
+        results = await store.exclusive(async () => {
+          const checkpoint: SendCheckpoint = {
+            previous: options.resend ? new Map() : store.sentRecipients(key),
+            record: (rows, state) => store.recordRecipients(key, rows, state),
+          };
+          const out = await sendDigest(config, message, checked.valid, { checkpoint });
+          if (out.some((r) => r.ok || r.alreadySent)) await store.recordIssue(issue);
+          return out;
+        });
+      } else {
+        results = await sendDigest(config, message, checked.valid);
       }
-
-      const results = await sendDigest({ apiKey, baseUrl: options.apiUrl }, message, checked.valid, { checkpoint });
       const sent = results.filter((r) => r.ok).length;
       const suppressed = results.filter((r) => r.suppressed);
       const alreadySent = results.filter((r) => r.alreadySent);
-      const failures = results.filter((r) => !r.ok && !r.suppressed && !r.alreadySent);
-
-      if (history && (sent > 0 || alreadySent.length > 0)) await history.recordIssue(issue);
+      const uncertain = results.filter((r) => r.uncertain);
+      const failures = results.filter((r) => !r.ok && !r.suppressed && !r.alreadySent && !r.uncertain);
 
       const skippedText =
-        (alreadySent.length ? `, skipped ${alreadySent.length} already sent by an earlier run (--resend sends to them again)` : "") +
+        (alreadySent.length ? `, skipped ${alreadySent.length} already sent by an earlier run` : "") +
         (suppressed.length ? `, skipped ${suppressed.length} suppressed` : "");
-      console.log(`${options.test ? "Test sent" : "Sent"} to ${sent}${skippedText}, failed ${failures.length}.`);
+      const uncertainText = uncertain.length ? `, ${uncertain.length} uncertain` : "";
+      console.log(`${options.test ? "Test sent" : "Sent"} to ${sent}${skippedText}${uncertainText}, failed ${failures.length}.`);
       if (suppressed.length) console.log(`  Suppressed (unsubscribed, bounced, or complained before): ${suppressed.map((r) => r.recipient).join(", ")}`);
+      if (uncertain.length) {
+        console.error(
+          `  ${plural(uncertain.length, "address")} may or may not have the email (SMTPfast gave a 5xx or no answer). They are skipped on a rerun; check the SMTPfast logs, then use --resend only if they did not get it.`,
+        );
+      }
       for (const failure of failures) console.error(`  ${failure.recipient}: ${failure.error}`);
-      if (failures.length > 0) process.exitCode = 1;
+      if (failures.length > 0 || uncertain.length > 0) process.exitCode = 1;
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
@@ -363,7 +373,7 @@ program
               `This plan includes ${plural(audience.broadcastLimit, "broadcast")} a month and ${audience.broadcastsUsed} have been used. Upgrade in SMTPfast or use feedletter send for a recipient list.`,
             );
           }
-          console.log(`Audience: ${plural(audience.eligible, "contact")} (${audienceLabel})${audience.skipped ? ` (${audience.skipped} skipped: unsubscribed, suppressed, or invalid)` : ""}.`);
+          console.log(`Audience (${audienceLabel}): ${plural(audience.eligible, "contact")}${audience.skipped ? `, ${audience.skipped} skipped (unsubscribed, suppressed, or invalid)` : ""}.`);
         }
       }
 
@@ -375,55 +385,59 @@ program
       const html = renderHtml(sendable);
       const text = renderText(sendable);
       const key = `broadcast:${segmentId ?? "all"}:${sendKey({ from: options.from, subject: issue.title, html, text })}`;
-      if (options.history) history = await HistoryStore.open(path.resolve(options.historyDb));
-
-      // A lost answer must not lead to a second campaign: reuse the broadcast an
-      // earlier run created for this exact issue, after checking its status.
-      let broadcastId = options.resend ? undefined : history?.broadcastFor(key);
-      if (broadcastId) {
-        let existing;
-        try {
-          existing = await getBroadcast(config, broadcastId);
-        } catch (error) {
-          if (!(error instanceof SmtpfastError && error.status === 404)) throw error;
+      const run = async (store?: HistoryStore) => {
+        // Only a draft from an earlier run is reused. Anything that may have
+        // reached contacts stops the run instead of creating a second campaign.
+        let broadcastId: string | undefined;
+        const savedId = options.resend ? undefined : store?.broadcastFor(key);
+        if (savedId) {
+          const decision = await checkSavedBroadcast(config, savedId);
+          if (decision.action === "stop") {
+            console.log(`${decision.message} ${decision.url}`);
+            console.log("Nothing sent. Use --resend to create a new broadcast anyway.");
+            if (decision.status === "failed" || decision.status === "canceled") process.exitCode = 1;
+            return;
+          }
+          if (decision.action === "reuse") {
+            broadcastId = decision.id;
+            console.log(`Using draft broadcast ${broadcastId} from an earlier run.`);
+          }
         }
-        if (existing && BROADCAST_SENT_STATUSES.has(existing.status)) {
-          console.log(`This issue was already broadcast (${existing.status}): ${existing.url}`);
-          console.log("Nothing sent. Use --resend to send it again as a new broadcast.");
+        if (!broadcastId) {
+          const draft = await createBroadcast(config, {
+            name: options.name ?? issue.title,
+            from: options.from,
+            subject: issue.title,
+            previewText: issue.preheader,
+            html,
+            text,
+            segmentId,
+          });
+          broadcastId = draft.id;
+          await store?.recordBroadcast(key, draft.id);
+          console.log(`Created draft broadcast ${draft.id} for ${audienceLabel}.`);
+        }
+
+        if (!options.send) {
+          console.log(`Review and send it in SMTPfast: ${broadcastUrl(broadcastId)}`);
+          console.log("Or rerun with --send to send it now.");
           return;
         }
-        if (existing?.status === "draft") {
-          console.log(`Using draft broadcast ${broadcastId} from an earlier run.`);
-        } else {
-          broadcastId = undefined;
-        }
-      }
-      if (!broadcastId) {
-        const draft = await createBroadcastOnce(config, {
-          name: options.name ?? issue.title,
-          from: options.from,
-          subject: issue.title,
-          previewText: issue.preheader,
-          html,
-          text,
-          segmentId,
-        });
-        broadcastId = draft.id;
-        await history?.recordBroadcast(key, draft.id);
-        console.log(`Created draft broadcast ${draft.id} for ${audienceLabel}.`);
-      }
 
-      if (!options.send) {
-        console.log(`Review and send it in SMTPfast: ${broadcastUrl(broadcastId)}`);
-        console.log("Or rerun with --send to send it now.");
-        return;
-      }
+        const sent = await sendBroadcastChecked(config, broadcastId);
+        if (store) await store.recordIssue(issue);
+        const count = sent.recipients !== undefined ? ` to ${plural(sent.recipients, "contact")}` : "";
+        const recovered = sent.recovered ? " (the answer to the send was lost; SMTPfast shows it as sent)" : "";
+        console.log(`Broadcast ${sent.status}${count}${recovered}. Track it at ${sent.url}`);
+      };
 
-      const sent = await sendBroadcastChecked(config, broadcastId);
-      if (history) await history.recordIssue(issue);
-      const count = sent.recipients !== undefined ? ` to ${plural(sent.recipients, "contact")}` : "";
-      const recovered = sent.recovered ? " (the answer to the send was lost; SMTPfast shows it as sent)" : "";
-      console.log(`Broadcast ${sent.status}${count}${recovered}. Track it at ${sent.url}`);
+      if (options.history) {
+        history = await HistoryStore.open(path.resolve(options.historyDb));
+        const store = history;
+        await store.exclusive(() => run(store));
+      } else {
+        await run();
+      }
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
