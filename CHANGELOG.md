@@ -1,5 +1,9 @@
 # Changelog
 
+## [0.3.1] - 2026-10-03
+
+Published from GitHub Actions with npm trusted publishing, so no npm token is stored anywhere. No code changes.
+
 ## [0.3.0] - 2026-10-03
 
 First release on npm: `npm install -g feedletter`.
