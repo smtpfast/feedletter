@@ -38,6 +38,12 @@ agent command such as Claude Code, Codex, or your own script.
 npm install -g feedletter
 ```
 
+Or try the studio without installing anything:
+
+```bash
+npx feedletter studio
+```
+
 For local development:
 
 ```bash
