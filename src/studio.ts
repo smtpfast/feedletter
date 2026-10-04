@@ -39,6 +39,8 @@ export interface StudioOptions {
   history?: boolean;
   agentCommand?: string;
   agentTimeoutMs?: number;
+  /** Waits before retrying a batch with an unknown outcome (tests set them to 0). */
+  retryDelaysMs?: number[];
 }
 
 interface ServerContext extends StudioOptions {
@@ -338,8 +340,9 @@ function checkpointFor(ctx: ServerContext, key: string): SendCheckpoint {
   if (store) {
     return {
       previous: store.sentRecipients(key),
-      record: (rows, state) => store.recordRecipients(key, rows, state),
+      record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
       forget: (recipients) => store.forgetRecipients(key, recipients),
+      uncertainBatches: () => store.uncertainBatches(key),
     };
   }
   const sent = ctx.memorySent.get(key) ?? new Map<string, "sent" | "uncertain">();
@@ -392,13 +395,16 @@ async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: Server
   let results: SendResult[];
   if (isTest) {
     // Test sends skip the checkpoint and never touch history.
-    results = await sendDigest(config, message, checked.valid);
+    results = await sendDigest(config, message, checked.valid, { retryDelaysMs: ctx.retryDelaysMs });
   } else {
     if (ctx.sending) return sendJson(res, 409, { error: BUSY_MESSAGE });
     try {
       results = await exclusiveSend(ctx, async () => {
         // A rerun of this exact send skips addresses an earlier run reached, or may have.
-        const out = await sendDigest(config, message, checked.valid, { checkpoint: checkpointFor(ctx, sendKey(message)) });
+        const out = await sendDigest(config, message, checked.valid, {
+          checkpoint: checkpointFor(ctx, sendKey(message)),
+          retryDelaysMs: ctx.retryDelaysMs,
+        });
         if (out.some((r) => r.ok || r.alreadySent)) await recordSent(ctx, email.subject, email.items, email.sourceLabel);
         return out;
       });

@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 export const SMTPFAST_DEFAULT_BASE_URL = "https://smtpfa.st/api";
 export const SMTPFAST_SIGNUP_URL = "https://smtpfa.st";
@@ -52,7 +52,16 @@ export class SmtpfastError extends Error {
 
 /** A 4xx from SMTPfast: the request was refused before anything was queued. */
 function refusedBeforeQueueing(error: unknown) {
-  return error instanceof SmtpfastError && error.status !== undefined && error.status >= 400 && error.status < 500;
+  // A 409 on a request with an Idempotency-Key is not a refusal: the key may
+  // belong to a batch that went out (an expired key, or a request still
+  // running), so its outcome is unknown.
+  return (
+    error instanceof SmtpfastError &&
+    error.status !== undefined &&
+    error.status >= 400 &&
+    error.status < 500 &&
+    error.status !== 409
+  );
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -196,42 +205,143 @@ export function sendKey(message: Omit<SmtpfastMessage, "to">) {
 }
 
 /**
- * Progress of one send, kept between runs. The batch endpoint has no
- * idempotency, so a rerun must skip addresses an earlier run may have reached.
- * Each batch is written ahead as uncertain before it goes out, then marked
- * sent, or forgotten when SMTPfast refuses it. A crash at any point leaves the
- * batch uncertain, never unrecorded.
+ * A new Idempotency-Key for one batch. It is random, not derived from the
+ * content, so an intentional resend is a new send; the key is written to the
+ * history file before the batch goes out, so retries and later runs reuse it.
+ */
+export function newBatchKey() {
+  return `feedletter-${randomUUID()}`;
+}
+
+/**
+ * Which SMTPfast account a batch went to: SMTPfast scopes keys per team, so a
+ * replay under another API key or endpoint would be a new send. Stored with
+ * the key as "scope:key"; a mismatch leaves the batch uncertain.
+ */
+function accountScope(config: SmtpfastConfig) {
+  const base = (config.baseUrl ?? SMTPFAST_DEFAULT_BASE_URL).replace(/\/$/, "");
+  return createHash("sha256").update(`${base}\n${config.apiKey}`).digest("hex").slice(0, 16);
+}
+
+/**
+ * Progress of one send, kept between runs. Each batch is written ahead as
+ * uncertain, with its Idempotency-Key, before it goes out, then marked sent,
+ * or forgotten when SMTPfast refuses it. A crash at any point leaves the batch
+ * uncertain, never unrecorded, and a later run replays it with the same key.
  */
 export interface SendCheckpoint {
   /** Lowercased addresses an earlier run of this exact send sent, or may have sent. */
   previous: Map<string, "sent" | "uncertain">;
-  record(rows: Array<{ recipient: string; id?: string }>, state: "sent" | "uncertain"): Promise<void> | void;
+  record(rows: Array<{ recipient: string; id?: string }>, state: "sent" | "uncertain", batchKey?: string): Promise<void> | void;
   /** Drop addresses written ahead for a batch SMTPfast refused with a 4xx (nothing was queued). */
   forget(recipients: string[]): Promise<void> | void;
+  /** Uncertain batches from earlier runs, in their original order, with the key each went out with. */
+  uncertainBatches?(): Array<{ key: string; recipients: string[] }>;
+}
+
+const DEFAULT_RETRY_DELAYS_MS = [2_000, 8_000];
+
+function batchRows(chunk: string[], response: BatchResponse): SendResult[] {
+  return chunk.map((recipient, index) => {
+    const row = response.emails?.[index];
+    return row?.status === "failed"
+      ? { recipient, ok: false, suppressed: true, id: row.id, error: "suppressed (unsubscribed, bounced, or complained before)" }
+      : { recipient, ok: true, id: row?.id };
+  });
+}
+
+/**
+ * POST one batch with its Idempotency-Key. A 5xx or a lost answer is retried
+ * with the same key and body, which SMTPfast answers with the first answer if
+ * the batch went out, so a retry cannot send twice.
+ */
+async function postBatch(
+  config: SmtpfastConfig,
+  base: Omit<SmtpfastMessage, "to">,
+  chunk: string[],
+  idempotencyKey: string,
+  retryDelaysMs: number[],
+): Promise<SendResult[]> {
+  let unknownBefore = false;
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const response = await smtpfastRequest<BatchResponse>(
+        config,
+        "POST",
+        "/v1/emails/batch",
+        chunk.map((recipient) => ({ ...base, to: [recipient] })),
+        { "idempotency-key": idempotencyKey },
+      );
+      return batchRows(chunk, response);
+    } catch (error) {
+      if (refusedBeforeQueueing(error) && unknownBefore) {
+        // An earlier attempt may have gone out, and this refusal (auth, rate
+        // limit) can come before SMTPfast looks the key up, so it proves nothing.
+        const message = error instanceof Error ? error.message : String(error);
+        throw new SmtpfastError(`${message} after an earlier attempt with an unknown outcome.`, undefined, true);
+      }
+      const retryable = !refusedBeforeQueueing(error) && !(error instanceof SmtpfastError && error.status === 409);
+      if (!retryable || attempt >= retryDelaysMs.length) throw error;
+      unknownBefore = true;
+      await sleep(retryDelaysMs[attempt]);
+    }
+  }
 }
 
 /**
  * Send one message per recipient so each gets their own {{unsubscribe_url}} and
  * nobody sees the rest of the list. Rows go out through the batch endpoint, up
- * to 100 per call. Returns a per-recipient result set.
+ * to 100 per call, each batch with an Idempotency-Key. Returns a per-recipient
+ * result set.
  *
  * SMTPfast answers every refusal (validation, auth, rate limit, quota) with a
- * 4xx before it queues anything, so a 4xx means "not sent". It queues rows one
- * by one, so a 5xx or a lost answer can be a partial send: those addresses are
- * marked uncertain and the send stops.
+ * 4xx before it queues anything, so a 4xx means "not sent", and a batch is
+ * queued all or nothing. A 5xx or a lost answer is retried with the same key;
+ * if the outcome is still unknown the addresses stay uncertain, the send
+ * stops, and the next run replays that batch with the same key.
  */
 export async function sendDigest(
   config: SmtpfastConfig,
   base: Omit<SmtpfastMessage, "to">,
   recipients: string[],
-  options: { checkpoint?: SendCheckpoint } = {},
+  options: { checkpoint?: SendCheckpoint; retryDelaysMs?: number[] } = {},
 ): Promise<SendResult[]> {
   const { valid, invalid } = checkRecipients(recipients);
   const results: SendResult[] = invalid.map((recipient) => ({ recipient, ok: false, error: "not a valid email address" }));
   const checkpoint = options.checkpoint;
+  const retryDelaysMs = options.retryDelaysMs ?? DEFAULT_RETRY_DELAYS_MS;
+
+  // Replay uncertain batches from earlier runs with the key each went out
+  // with: SMTPfast answers with the first answer if the batch went out, and
+  // sends it now if it never did. Only a batch whose addresses are all in this
+  // run's list can be replayed; SMTPfast refuses a changed body with a 409.
+  const replayed = new Map<string, SendResult>();
+  const original = new Map(valid.map((recipient) => [recipient.toLowerCase(), recipient]));
+  const scope = accountScope(config);
+  for (const batch of checkpoint?.uncertainBatches?.() ?? []) {
+    const chunk = batch.recipients.map((recipient) => original.get(recipient));
+    if (chunk.some((recipient) => recipient === undefined)) continue;
+    const [batchScope, idempotencyKey] = batch.key.split(":", 2);
+    if (batchScope !== scope || !idempotencyKey) continue;
+    try {
+      const rows = await postBatch(config, base, chunk as string[], idempotencyKey, retryDelaysMs);
+      await checkpoint?.record(rows, "sent", batch.key);
+      for (const row of rows) replayed.set(row.recipient.toLowerCase(), row);
+    } catch {
+      // Any failure leaves them uncertain: a refusal here (auth, rate limit,
+      // an expired key) does not show what the earlier attempt did.
+    }
+  }
+
   const pending: string[] = [];
   for (const recipient of valid) {
-    const previous = checkpoint?.previous.get(recipient.toLowerCase());
+    const lower = recipient.toLowerCase();
+    const done = replayed.get(lower);
+    if (done) {
+      results.push(done);
+      continue;
+    }
+    const previous = checkpoint?.previous.get(lower);
     if (previous === "sent") {
       results.push({ recipient, ok: false, alreadySent: true, error: "already sent in an earlier run" });
     } else if (previous === "uncertain") {
@@ -248,9 +358,11 @@ export async function sendDigest(
       results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: `not sent: ${stopError}` })));
       continue;
     }
-    // Write ahead: the batch is uncertain on disk before it goes out.
+    const idempotencyKey = newBatchKey();
+    const storedKey = `${scope}:${idempotencyKey}`;
+    // Write ahead: the batch is uncertain on disk, with its key, before it goes out.
     try {
-      await checkpoint?.record(chunk.map((recipient) => ({ recipient })), "uncertain");
+      await checkpoint?.record(chunk.map((recipient) => ({ recipient })), "uncertain", storedKey);
     } catch (error) {
       stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
       results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: `not sent: ${stopError}` })));
@@ -259,30 +371,19 @@ export async function sendDigest(
     let rows: SendResult[] | undefined;
     let refused: string | undefined;
     try {
-      const response = await smtpfastRequest<BatchResponse>(
-        config,
-        "POST",
-        "/v1/emails/batch",
-        chunk.map((recipient) => ({ ...base, to: [recipient] })),
-      );
-      rows = chunk.map((recipient, index) => {
-        const row = response.emails?.[index];
-        return row?.status === "failed"
-          ? { recipient, ok: false, suppressed: true, id: row.id, error: "suppressed (unsubscribed, bounced, or complained before)" }
-          : { recipient, ok: true, id: row?.id };
-      });
+      rows = await postBatch(config, base, chunk, idempotencyKey, retryDelaysMs);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       if (refusedBeforeQueueing(error)) {
         refused = message;
       } else {
-        // A 5xx or no answer can be a partial send: the batch stays uncertain on disk.
+        // Still unknown after the retries: the batch stays uncertain on disk, and the next run replays it.
         results.push(
           ...chunk.map((recipient) => ({
             recipient,
             ok: false,
             uncertain: true,
-            error: `${message} SMTPfast may have sent some of this batch; check the SMTPfast logs.`,
+            error: `${message} SMTPfast may have sent this batch; the next run checks it with the same key.`,
           })),
         );
         stopError = "stopped after a batch with an unknown outcome";
@@ -290,10 +391,10 @@ export async function sendDigest(
       }
     }
     try {
-      if (rows) await checkpoint?.record(rows, "sent");
+      if (rows) await checkpoint?.record(rows, "sent", storedKey);
       else await checkpoint?.forget(chunk);
     } catch (error) {
-      // The batch stays recorded as uncertain, so a rerun skips it; stop here.
+      // The batch stays recorded as uncertain, so a rerun replays it; stop here.
       stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
     }
     if (rows) {

@@ -110,7 +110,7 @@ beforeAll(async () => {
     "---\ntitle: Post B\ndate: 2026-05-01\n---\nBody B",
   );
 
-  studio = await startStudioServer({ host: "127.0.0.1", port: 0, history: false });
+  studio = await startStudioServer({ host: "127.0.0.1", port: 0, retryDelaysMs: [0, 0], history: false });
   base = `http://127.0.0.1:${(studio.address() as AddressInfo).port}`;
 });
 
@@ -299,7 +299,7 @@ describe("studio server", () => {
 
   it("refuses to send while another process holds the history lock", async () => {
     const historyDb = path.join(contentDir, "locked.sqlite");
-    const second = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
+    const second = await startStudioServer({ host: "127.0.0.1", port: 0, retryDelaysMs: [0, 0], historyDb });
     const other = await HistoryStore.open(historyDb);
     let release!: () => void;
     let holding!: Promise<void>;
@@ -341,7 +341,7 @@ describe("studio server", () => {
 
   it("trusts the history file over memory when history is on", async () => {
     const historyDb = path.join(contentDir, "authoritative.sqlite");
-    const studioWithHistory = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
+    const studioWithHistory = await startStudioServer({ host: "127.0.0.1", port: 0, retryDelaysMs: [0, 0], historyDb });
     const url = `http://127.0.0.1:${(studioWithHistory.address() as AddressInfo).port}/api/broadcast`;
     const call = (extra: Record<string, unknown>) =>
       fetch(url, {
@@ -373,7 +373,7 @@ describe("studio server", () => {
 
   it("answers 409 when a previous send left its lock behind", async () => {
     const historyDb = path.join(contentDir, "stale.sqlite");
-    const studioWithHistory = await startStudioServer({ host: "127.0.0.1", port: 0, historyDb });
+    const studioWithHistory = await startStudioServer({ host: "127.0.0.1", port: 0, retryDelaysMs: [0, 0], historyDb });
     await writeFile(`${historyDb}.lock`, "2147483646\n");
     try {
       const res = await fetch(`http://127.0.0.1:${(studioWithHistory.address() as AddressInfo).port}/api/send`, {

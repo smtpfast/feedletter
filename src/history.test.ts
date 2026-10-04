@@ -146,3 +146,23 @@ describe("HistoryStore send lock", () => {
   });
 });
 
+describe("HistoryStore batch keys", () => {
+  it("adds the batch key column to a history file written before it existed, and keeps old rows unreplayable", async () => {
+    const dbPath = path.join(dir, "old.sqlite");
+    const initSqlJs = (await import("sql.js")).default;
+    const SQL = await initSqlJs();
+    const old = new SQL.Database();
+    old.run(`CREATE TABLE sent_recipients (send_key TEXT NOT NULL, recipient TEXT NOT NULL, email_id TEXT, sent_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'sent', PRIMARY KEY (send_key, recipient));
+      INSERT INTO sent_recipients VALUES ('key', 'old@example.com', NULL, '2026-10-01T00:00:00Z', 'uncertain');`);
+    await writeFile(dbPath, Buffer.from(old.export()));
+    old.close();
+
+    const store = await HistoryStore.open(dbPath);
+    expect(store.sentRecipients("key").get("old@example.com")).toBe("uncertain");
+    expect(store.uncertainBatches("key")).toEqual([]);
+    await store.exclusive(() => store.recordRecipients("key", [{ recipient: "New@example.com" }, { recipient: "two@example.com" }], "uncertain", "feedletter-abc"));
+    expect(store.uncertainBatches("key")).toEqual([{ key: "feedletter-abc", recipients: ["new@example.com", "two@example.com"] }]);
+    store.close();
+  });
+});
+
