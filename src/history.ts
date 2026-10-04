@@ -184,10 +184,15 @@ export class HistoryStore {
    * Writing ahead as uncertain never touches an existing row, so a refused
    * --resend cannot erase what an earlier run sent.
    */
-  async recordRecipients(sendKey: string, rows: Array<{ recipient: string; id?: string }>, state: RecipientState = "sent") {
+  async recordRecipients(
+    sendKey: string,
+    rows: Array<{ recipient: string; id?: string }>,
+    state: RecipientState = "sent",
+    batchKey?: string,
+  ) {
     const ahead = state === "uncertain";
     const stmt = this.db.prepare(
-      `INSERT OR ${ahead ? "IGNORE" : "REPLACE"} INTO sent_recipients (send_key, recipient, email_id, sent_at, state) VALUES (?, ?, ?, ?, ?)`,
+      `INSERT OR ${ahead ? "IGNORE" : "REPLACE"} INTO sent_recipients (send_key, recipient, email_id, sent_at, state, batch_key) VALUES (?, ?, ?, ?, ?, ?)`,
     );
     const now = new Date().toISOString();
     // Batches go one at a time, so the set only ever holds the current batch.
@@ -195,7 +200,7 @@ export class HistoryStore {
     try {
       for (const row of rows) {
         const recipient = row.recipient.toLowerCase();
-        stmt.run([sendKey, recipient, row.id ?? null, now, state]);
+        stmt.run([sendKey, recipient, row.id ?? null, now, state, batchKey ?? null]);
         if (ahead && this.db.getRowsModified() > 0) written.add(recipient);
         if (!ahead) written.delete(recipient);
       }
@@ -220,6 +225,40 @@ export class HistoryStore {
         stmt.run([sendKey, recipient]);
         written.delete(recipient);
       }
+    } finally {
+      stmt.free();
+    }
+    await this.persist();
+  }
+
+  /**
+   * Uncertain batches of this send, each with the Idempotency-Key it went out
+   * with, in the order its addresses were written (the order of the batch).
+   */
+  uncertainBatches(sendKey: string): Array<{ key: string; recipients: string[] }> {
+    const batches = new Map<string, string[]>();
+    const stmt = this.db.prepare(
+      "SELECT recipient, batch_key FROM sent_recipients WHERE send_key = ? AND state = 'uncertain' AND batch_key IS NOT NULL ORDER BY rowid",
+    );
+    try {
+      stmt.bind([sendKey]);
+      while (stmt.step()) {
+        const [recipient, key] = stmt.get();
+        const list = batches.get(String(key)) ?? [];
+        list.push(String(recipient));
+        batches.set(String(key), list);
+      }
+    } finally {
+      stmt.free();
+    }
+    return [...batches].map(([key, recipients]) => ({ key, recipients }));
+  }
+
+  /** Clear uncertain addresses SMTPfast showed were never sent, so this run can send them. */
+  async releaseUncertain(sendKey: string, recipients: string[]) {
+    const stmt = this.db.prepare("DELETE FROM sent_recipients WHERE send_key = ? AND recipient = ? AND state = 'uncertain'");
+    try {
+      for (const recipient of recipients) stmt.run([sendKey, recipient.toLowerCase()]);
     } finally {
       stmt.free();
     }
@@ -276,6 +315,7 @@ export class HistoryStore {
         email_id TEXT,
         sent_at TEXT NOT NULL,
         state TEXT NOT NULL DEFAULT 'sent',
+        batch_key TEXT,
         PRIMARY KEY (send_key, recipient)
       );
 
@@ -288,6 +328,10 @@ export class HistoryStore {
       CREATE INDEX IF NOT EXISTS included_items_issue_key_idx ON included_items(issue_key);
       CREATE INDEX IF NOT EXISTS included_items_included_at_idx ON included_items(included_at);
     `);
+    // History files from before batch keys get the column; old rows keep NULL
+    // and so are never replayed.
+    const columns = this.db.exec("PRAGMA table_info(sent_recipients)")[0]?.values.map((row) => String(row[1])) ?? [];
+    if (!columns.includes("batch_key")) this.db.run("ALTER TABLE sent_recipients ADD COLUMN batch_key TEXT");
   }
 
   private async persist() {

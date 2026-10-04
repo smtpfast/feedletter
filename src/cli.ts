@@ -290,17 +290,21 @@ program
       const config = { apiKey, baseUrl: options.apiUrl };
       let results;
       if (options.history && !options.test) {
-        // The batch endpoint has no idempotency, so progress is recorded after
-        // each batch and a rerun of this exact send skips those addresses. The
-        // lock stops two processes from sending with the same history file.
+        // Progress is recorded around each batch, so a rerun of this exact send
+        // skips addresses already sent and replays uncertain batches with their
+        // Idempotency-Key. The lock stops two processes from sending with the
+        // same history file.
         history = await HistoryStore.open(path.resolve(options.historyDb));
         const store = history;
         const key = sendKey(message);
         results = await store.exclusive(async () => {
           const checkpoint: SendCheckpoint = {
             previous: options.resend ? new Map() : store.sentRecipients(key),
-            record: (rows, state) => store.recordRecipients(key, rows, state),
+            record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
             forget: (recipients) => store.forgetRecipients(key, recipients),
+            // --resend sends everyone again, so it replays nothing.
+            uncertainBatches: () => (options.resend ? [] : store.uncertainBatches(key)),
+            release: (recipients) => store.releaseUncertain(key, recipients),
           };
           const out = await sendDigest(config, message, checked.valid, { checkpoint });
           if (out.some((r) => r.ok || r.alreadySent)) await store.recordIssue(issue);

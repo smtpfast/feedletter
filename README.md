@@ -278,15 +278,21 @@ limit is retried after `Retry-After`, up to three times.
 Reruns never send the same email twice. When Feedletter cannot tell what
 happened, it stops and says so:
 
-- `send` records each batch in the history file as uncertain before it goes
-  out, then marks it sent when SMTPfast accepts it. SMTPfast refuses a batch
-  with a 4xx before it queues anything, so a refused batch is removed from the
-  record. A 5xx, a lost answer, or a crash leaves the batch uncertain: the send
-  stops, and the count is printed. Run the same command
-  again to send to the rest: it skips addresses that already got this exact
-  issue and the uncertain ones. Check the SMTPfast logs, then use `--resend`
-  only if they did not get it. With `--no-history` there is no record, so a
-  rerun sends to everyone.
+- `send` sends each batch with an `Idempotency-Key` made from the issue and
+  the batch's addresses, and records the batch in the history file as
+  uncertain before it goes out, then marks it sent when SMTPfast accepts it.
+  SMTPfast queues a batch all or nothing and refuses it with a 4xx before it
+  queues anything, so a refused batch is removed from the record. A 5xx or a
+  lost answer is retried twice with the same key: SMTPfast answers a repeated
+  key with its first answer, so a retry never sends twice. If the outcome is
+  still unknown (or the process crashes), the batch stays uncertain and the
+  send stops. Run the same command again: it replays each uncertain batch with
+  its key (within SMTPfast's 24 hour key window), so a batch that went out is
+  marked sent and one that never did is sent now, then it continues with the
+  rest. A batch it cannot replay (the key expired, or the recipient list
+  changed) stays uncertain and is skipped; check the SMTPfast logs, then use
+  `--resend` only if those addresses did not get it. With `--no-history` there
+  is no record, so a rerun sends to everyone.
 - `broadcast` records the id of the broadcast it creates and reuses it only
   while it is a draft whose audience, sender, and subject still match this
   run (a draft can be edited in the dashboard). If SMTPfast shows it as sent,

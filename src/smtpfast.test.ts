@@ -7,6 +7,7 @@ import path from "node:path";
 import { HistoryStore } from "./history.js";
 import {
   BROADCAST_HTML_LIMIT,
+  batchIdempotencyKey,
   checkRecipients,
   createBroadcast,
   checkSavedBroadcast,
@@ -90,8 +91,11 @@ describe("sendDigest", () => {
     const firstRow = (calls[0].body as Array<{ to: string[]; html: string }>)[0];
     expect(firstRow.to).toEqual(["user0@example.com"]);
     expect(firstRow.html).toContain("{{unsubscribe_url}}");
-    // The batch endpoint does not honour Idempotency-Key, so none is sent.
-    expect(calls[0].headers["idempotency-key"]).toBeUndefined();
+    // Each batch carries its own key, made from the issue and its addresses.
+    const keys = calls.map((c) => c.headers["idempotency-key"]);
+    expect(keys[0]).toMatch(/^feedletter-[0-9a-f]{40}$/);
+    expect(new Set(keys).size).toBe(3);
+    expect(keys[0]).toBe(batchIdempotencyKey(sendKey(message), recipients.slice(0, 100)));
     expect(results.filter((r) => r.ok)).toHaveLength(250);
   });
 
@@ -109,13 +113,15 @@ describe("sendDigest", () => {
     const key = sendKey(message);
     return {
       previous: resend ? new Map() : store.sentRecipients(key),
-      record: (rows, state) => store.recordRecipients(key, rows, state),
+      record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
       forget: (recipients) => store.forgetRecipients(key, recipients),
+      uncertainBatches: () => (resend ? [] : store.uncertainBatches(key)),
+      release: (recipients) => store.releaseUncertain(key, recipients),
     };
   };
   // Every history write happens under the lock, as in the CLI and the studio.
   const send = (store: HistoryStore, list: string[], resend = false) =>
-    store.exclusive(() => sendDigest(config, message, list, { checkpoint: checkpointFor(store, resend) }));
+    store.exclusive(() => sendDigest(config, message, list, { checkpoint: checkpointFor(store, resend), retryDelaysMs: [0, 0] }));
   const recipients150 = Array.from({ length: 150 }, (_, i) => `user${i}@example.com`);
 
   it("resends only the refused batch on a rerun after a 4xx", async () => {
@@ -136,26 +142,91 @@ describe("sendDigest", () => {
     });
   });
 
-  it("marks a batch that ended in a 5xx as uncertain, stops, and skips it on a rerun", async () => {
+  it("retries a 5xx with the same key and body, so a retry cannot send twice", async () => {
+    mockApi((call, index) => (index < 2 ? { status: 502, body: { error: "Bad gateway" } } : okBatch(call)));
+    const results = await sendDigest(config, message, ["a@example.com", "b@example.com"], { retryDelaysMs: [0, 0] });
+    expect(calls).toHaveLength(3);
+    expect(new Set(calls.map((c) => c.headers["idempotency-key"])).size).toBe(1);
+    expect(new Set(calls.map((c) => JSON.stringify(c.body))).size).toBe(1);
+    expect(results.every((r) => r.ok)).toBe(true);
+  });
+
+  it("does not retry a 409 and does not treat it as a refusal", async () => {
+    mockApi(() => ({ status: 409, body: { error: "This Idempotency-Key was used more than 24 hours ago. Send with a new key." } }));
+    const [result] = await sendDigest(config, message, ["a@example.com"], { retryDelaysMs: [0, 0] });
+    expect(calls).toHaveLength(1);
+    expect(result).toMatchObject({ ok: false, uncertain: true });
+  });
+
+  it("marks a batch that is still unknown after the retries as uncertain, stops, and replays it with its key on a rerun", async () => {
     await withStore(async (store) => {
       const recipients = Array.from({ length: 250 }, (_, i) => `user${i}@example.com`);
       mockApi((call, index) => (index === 0 ? okBatch(call) : { status: 500, body: { error: "Internal error" } }));
       const first = await send(store, recipients);
-      expect(calls).toHaveLength(2);
+      // The first batch, then the second one three times (two retries), then stop.
+      expect(calls).toHaveLength(4);
       expect(first.filter((r) => r.ok)).toHaveLength(100);
       expect(first.filter((r) => r.uncertain)).toHaveLength(100);
       expect(first.filter((r) => /stopped after a batch with an unknown outcome/.test(r.error ?? ""))).toHaveLength(50);
+      const failedKey = calls[1].headers["idempotency-key"];
 
-      // The rerun sends only the 50 that never went out; the uncertain 100 are skipped.
+      // The rerun replays the uncertain batch with the same key and body, then sends the 50 that never went out.
       mockApi(okBatch);
       const second = await send(store, recipients);
-      expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients.slice(200));
-      expect(second.filter((r) => r.uncertain)).toHaveLength(100);
+      expect(calls).toHaveLength(2);
+      expect(calls[0].headers["idempotency-key"]).toBe(failedKey);
+      expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients.slice(100, 200));
+      expect((calls[1].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(recipients.slice(200));
+      expect(second.filter((r) => r.ok)).toHaveLength(150);
+      expect(second.filter((r) => r.alreadySent)).toHaveLength(100);
+      expect(second.filter((r) => r.uncertain)).toHaveLength(0);
 
-      // --resend sends to everyone.
+      // Everyone is recorded as sent now.
       mockApi(okBatch);
-      await send(store, recipients, true);
-      expect(calls.reduce((sum, call) => sum + (call.body as unknown[]).length, 0)).toBe(250);
+      const third = await send(store, recipients);
+      expect(calls).toHaveLength(0);
+      expect(third.filter((r) => r.alreadySent)).toHaveLength(250);
+    });
+  });
+
+  it("keeps a batch uncertain when its key can no longer be replayed", async () => {
+    await withStore(async (store) => {
+      mockApi(() => ({ status: 500, body: { error: "Internal error" } }));
+      await send(store, ["a@example.com"]);
+      // More than 24 hours later SMTPfast answers the old key with a 409.
+      mockApi(() => ({ status: 409, body: { error: "This Idempotency-Key was used more than 24 hours ago. Send with a new key." } }));
+      const [result] = await send(store, ["a@example.com"]);
+      expect(calls).toHaveLength(1);
+      expect(result).toMatchObject({ ok: false, uncertain: true });
+      // --resend sends again with a fresh write-ahead.
+      mockApi(okBatch);
+      const [again] = await send(store, ["a@example.com"], true);
+      expect(again.ok).toBe(true);
+    });
+  });
+
+  it("sends an uncertain batch normally when SMTPfast shows it never went out", async () => {
+    await withStore(async (store) => {
+      mockApi(() => new TypeError("socket hang up"));
+      await send(store, ["a@example.com", "b@example.com"]);
+      // A 4xx on the replay means no batch was stored under that key: nothing went out before.
+      mockApi((call, index) => (index === 0 ? { status: 403, body: { error: "domain not verified" } } : okBatch(call)));
+      const results = await send(store, ["a@example.com", "b@example.com"]);
+      expect(calls).toHaveLength(2);
+      expect(results.every((r) => r.ok)).toBe(true);
+    });
+  });
+
+  it("does not replay a batch whose recipients changed", async () => {
+    await withStore(async (store) => {
+      mockApi(() => ({ status: 500, body: { error: "Internal error" } }));
+      await send(store, ["a@example.com", "b@example.com"]);
+      mockApi(okBatch);
+      // b@ is no longer on the list, so the stored batch cannot be repeated exactly; a@ stays uncertain.
+      const results = await send(store, ["a@example.com", "c@example.com"]);
+      expect(calls).toHaveLength(1);
+      expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(["c@example.com"]);
+      expect(results.find((r) => r.recipient === "a@example.com")).toMatchObject({ uncertain: true });
     });
   });
 
@@ -254,7 +325,8 @@ describe("sendDigest", () => {
     try {
       const local = { apiKey: "k", baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}` };
       expect((await sendDigest(local, message, ["a@example.com"]))[0].ok).toBe(true);
-      const [dropped] = await sendDigest(local, { ...message, subject: "Second" }, ["b@example.com"]);
+      // No retries here: this checks that fetch itself never repeats a POST.
+      const [dropped] = await sendDigest(local, { ...message, subject: "Second" }, ["b@example.com"], { retryDelaysMs: [] });
       expect(dropped).toMatchObject({ ok: false, uncertain: true });
       expect(batches).toBe(2);
     } finally {
@@ -264,9 +336,10 @@ describe("sendDigest", () => {
 
   it("marks a batch with no answer as uncertain", async () => {
     mockApi(() => new TypeError("socket hang up"));
-    const [result] = await sendDigest(config, message, ["a@example.com"]);
+    const [result] = await sendDigest(config, message, ["a@example.com"], { retryDelaysMs: [0, 0] });
+    expect(calls).toHaveLength(3);
     expect(result).toMatchObject({ ok: false, uncertain: true });
-    expect(result.error).toMatch(/may have sent some of this batch/);
+    expect(result.error).toMatch(/may have sent this batch/);
   });
 });
 
