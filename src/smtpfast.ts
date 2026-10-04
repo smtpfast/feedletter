@@ -214,6 +214,16 @@ export function newBatchKey() {
 }
 
 /**
+ * Which SMTPfast account a batch went to: SMTPfast scopes keys per team, so a
+ * replay under another API key or endpoint would be a new send. Stored with
+ * the key as "scope:key"; a mismatch leaves the batch uncertain.
+ */
+function accountScope(config: SmtpfastConfig) {
+  const base = (config.baseUrl ?? SMTPFAST_DEFAULT_BASE_URL).replace(/\/$/, "");
+  return createHash("sha256").update(`${base}\n${config.apiKey}`).digest("hex").slice(0, 16);
+}
+
+/**
  * Progress of one send, kept between runs. Each batch is written ahead as
  * uncertain, with its Idempotency-Key, before it goes out, then marked sent,
  * or forgotten when SMTPfast refuses it. A crash at any point leaves the batch
@@ -307,11 +317,14 @@ export async function sendDigest(
   // run's list can be replayed; SMTPfast refuses a changed body with a 409.
   const replayed = new Map<string, SendResult>();
   const original = new Map(valid.map((recipient) => [recipient.toLowerCase(), recipient]));
+  const scope = accountScope(config);
   for (const batch of checkpoint?.uncertainBatches?.() ?? []) {
     const chunk = batch.recipients.map((recipient) => original.get(recipient));
     if (chunk.some((recipient) => recipient === undefined)) continue;
+    const [batchScope, idempotencyKey] = batch.key.split(":", 2);
+    if (batchScope !== scope || !idempotencyKey) continue;
     try {
-      const rows = await postBatch(config, base, chunk as string[], batch.key, retryDelaysMs);
+      const rows = await postBatch(config, base, chunk as string[], idempotencyKey, retryDelaysMs);
       await checkpoint?.record(rows, "sent", batch.key);
       for (const row of rows) replayed.set(row.recipient.toLowerCase(), row);
     } catch {
@@ -346,9 +359,10 @@ export async function sendDigest(
       continue;
     }
     const idempotencyKey = newBatchKey();
+    const storedKey = `${scope}:${idempotencyKey}`;
     // Write ahead: the batch is uncertain on disk, with its key, before it goes out.
     try {
-      await checkpoint?.record(chunk.map((recipient) => ({ recipient })), "uncertain", idempotencyKey);
+      await checkpoint?.record(chunk.map((recipient) => ({ recipient })), "uncertain", storedKey);
     } catch (error) {
       stopError = `could not save send progress (${error instanceof Error ? error.message : String(error)})`;
       results.push(...chunk.map((recipient) => ({ recipient, ok: false, error: `not sent: ${stopError}` })));
@@ -377,7 +391,7 @@ export async function sendDigest(
       }
     }
     try {
-      if (rows) await checkpoint?.record(rows, "sent", idempotencyKey);
+      if (rows) await checkpoint?.record(rows, "sent", storedKey);
       else await checkpoint?.forget(chunk);
     } catch (error) {
       // The batch stays recorded as uncertain, so a rerun replays it; stop here.

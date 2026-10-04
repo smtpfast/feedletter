@@ -253,7 +253,31 @@ describe("sendDigest", () => {
       mockApi(() => ({ status: 403, body: { error: "domain not verified" } }));
       await send(store, ["a@example.com"], true);
       // The refused resend sent nothing, so the first attempt is still the one to replay.
-      expect(store.uncertainBatches(sendKey(message))).toEqual([{ key: firstKey, recipients: ["a@example.com"] }]);
+      expect(store.uncertainBatches(sendKey(message))).toEqual([{ key: expect.stringMatching(new RegExp(`:${firstKey}$`)), recipients: ["a@example.com"] }]);
+    });
+  }, STORE_TEST_TIMEOUT_MS);
+
+  it("replays an uncertain batch only to the same SMTPfast account and endpoint", async () => {
+    await withStore(async (store) => {
+      mockApi(() => new TypeError("socket hang up"));
+      await send(store, ["a@example.com"]);
+      // Another API key could be another team, where the saved key means nothing: no replay.
+      mockApi(okBatch);
+      const key = sendKey(message);
+      const other = { ...config, apiKey: "another-team-key" };
+      const [result] = await store.exclusive(() =>
+        sendDigest(other, message, ["a@example.com"], {
+          checkpoint: { previous: store.sentRecipients(key), record: (rows, state, k) => store.recordRecipients(key, rows, state, k), forget: (list) => store.forgetRecipients(key, list), uncertainBatches: () => store.uncertainBatches(key) },
+          retryDelaysMs: [0, 0],
+        }),
+      );
+      expect(calls).toHaveLength(0);
+      expect(result).toMatchObject({ uncertain: true });
+      // The original account replays it.
+      mockApi(okBatch);
+      const [again] = await send(store, ["a@example.com"]);
+      expect(calls).toHaveLength(1);
+      expect(again.ok).toBe(true);
     });
   }, STORE_TEST_TIMEOUT_MS);
 
