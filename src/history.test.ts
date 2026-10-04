@@ -162,8 +162,6 @@ describe("HistoryStore batch keys", () => {
     expect(store.uncertainBatches("key")).toEqual([]);
     await store.exclusive(() => store.recordRecipients("key", [{ recipient: "New@example.com" }, { recipient: "two@example.com" }], "uncertain", "feedletter-abc"));
     expect(store.uncertainBatches("key")).toEqual([{ key: "feedletter-abc", recipients: ["new@example.com", "two@example.com"] }]);
-    await store.exclusive(() => store.releaseUncertain("key", ["NEW@example.com"]));
-    expect(store.sentRecipients("key").has("new@example.com")).toBe(false);
     store.close();
   });
 });

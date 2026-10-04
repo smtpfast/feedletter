@@ -343,7 +343,6 @@ function checkpointFor(ctx: ServerContext, key: string): SendCheckpoint {
       record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
       forget: (recipients) => store.forgetRecipients(key, recipients),
       uncertainBatches: () => store.uncertainBatches(key),
-      release: (recipients) => store.releaseUncertain(key, recipients),
     };
   }
   const sent = ctx.memorySent.get(key) ?? new Map<string, "sent" | "uncertain">();

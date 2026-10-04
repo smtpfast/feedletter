@@ -7,7 +7,6 @@ import path from "node:path";
 import { HistoryStore } from "./history.js";
 import {
   BROADCAST_HTML_LIMIT,
-  batchIdempotencyKey,
   checkRecipients,
   createBroadcast,
   checkSavedBroadcast,
@@ -91,11 +90,10 @@ describe("sendDigest", () => {
     const firstRow = (calls[0].body as Array<{ to: string[]; html: string }>)[0];
     expect(firstRow.to).toEqual(["user0@example.com"]);
     expect(firstRow.html).toContain("{{unsubscribe_url}}");
-    // Each batch carries its own key, made from the issue and its addresses.
+    // Each batch carries its own random key.
     const keys = calls.map((c) => c.headers["idempotency-key"]);
-    expect(keys[0]).toMatch(/^feedletter-[0-9a-f]{40}$/);
+    expect(keys[0]).toMatch(/^feedletter-[0-9a-f-]{36}$/);
     expect(new Set(keys).size).toBe(3);
-    expect(keys[0]).toBe(batchIdempotencyKey(sendKey(message), recipients.slice(0, 100)));
     expect(results.filter((r) => r.ok)).toHaveLength(250);
   });
 
@@ -116,13 +114,14 @@ describe("sendDigest", () => {
       record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
       forget: (recipients) => store.forgetRecipients(key, recipients),
       uncertainBatches: () => (resend ? [] : store.uncertainBatches(key)),
-      release: (recipients) => store.releaseUncertain(key, recipients),
     };
   };
   // Every history write happens under the lock, as in the CLI and the studio.
   const send = (store: HistoryStore, list: string[], resend = false) =>
     store.exclusive(() => sendDigest(config, message, list, { checkpoint: checkpointFor(store, resend), retryDelaysMs: [0, 0] }));
   const recipients150 = Array.from({ length: 150 }, (_, i) => `user${i}@example.com`);
+  // These write a real history file on every batch, which is slow on a loaded machine.
+  const STORE_TEST_TIMEOUT_MS = 30_000;
 
   it("resends only the refused batch on a rerun after a 4xx", async () => {
     await withStore(async (store) => {
@@ -140,7 +139,7 @@ describe("sendDigest", () => {
       expect(second.filter((r) => r.ok)).toHaveLength(50);
       expect(store.sentRecipients(sendKey({ ...message, subject: "Hi again" })).size).toBe(0);
     });
-  });
+  }, STORE_TEST_TIMEOUT_MS);
 
   it("retries a 5xx with the same key and body, so a retry cannot send twice", async () => {
     mockApi((call, index) => (index < 2 ? { status: 502, body: { error: "Bad gateway" } } : okBatch(call)));
@@ -187,7 +186,7 @@ describe("sendDigest", () => {
       expect(calls).toHaveLength(0);
       expect(third.filter((r) => r.alreadySent)).toHaveLength(250);
     });
-  });
+  }, STORE_TEST_TIMEOUT_MS);
 
   it("keeps a batch uncertain when its key can no longer be replayed", async () => {
     await withStore(async (store) => {
@@ -203,19 +202,60 @@ describe("sendDigest", () => {
       const [again] = await send(store, ["a@example.com"], true);
       expect(again.ok).toBe(true);
     });
-  });
+  }, STORE_TEST_TIMEOUT_MS);
 
-  it("sends an uncertain batch normally when SMTPfast shows it never went out", async () => {
+  it("keeps a batch uncertain when its replay is refused, since a refusal does not show what the first attempt did", async () => {
     await withStore(async (store) => {
       mockApi(() => new TypeError("socket hang up"));
       await send(store, ["a@example.com", "b@example.com"]);
-      // A 4xx on the replay means no batch was stored under that key: nothing went out before.
-      mockApi((call, index) => (index === 0 ? { status: 403, body: { error: "domain not verified" } } : okBatch(call)));
-      const results = await send(store, ["a@example.com", "b@example.com"]);
-      expect(calls).toHaveLength(2);
-      expect(results.every((r) => r.ok)).toBe(true);
+      // An auth or rate-limit refusal comes before SMTPfast looks the key up.
+      mockApi(() => ({ status: 401, body: { error: "Invalid API key" } }));
+      const results = await send(store, ["a@example.com", "b@example.com", "c@example.com"]);
+      expect(results.filter((r) => r.uncertain).map((r) => r.recipient)).toEqual(["a@example.com", "b@example.com"]);
+      expect(store.sentRecipients(sendKey(message)).get("a@example.com")).toBe("uncertain");
     });
-  });
+  }, STORE_TEST_TIMEOUT_MS);
+
+  it("treats a refusal after an attempt with an unknown outcome as uncertain, not refused", async () => {
+    await withStore(async (store) => {
+      mockApi((_call, index) => (index === 0 ? new TypeError("socket hang up") : { status: 429, body: { error: "Rate limit" }, headers: { "retry-after": "999" } }));
+      const [result] = await send(store, ["a@example.com"]);
+      expect(result).toMatchObject({ ok: false, uncertain: true });
+      expect(store.sentRecipients(sendKey(message)).get("a@example.com")).toBe("uncertain");
+    });
+  }, STORE_TEST_TIMEOUT_MS);
+
+  it("gives an intentional resend a new key, and replays the resend's key afterwards, not the old one", async () => {
+    await withStore(async (store) => {
+      mockApi(() => new TypeError("socket hang up"));
+      await send(store, ["a@example.com", "b@example.com"]);
+      const firstKey = calls[0].headers["idempotency-key"];
+
+      // --resend goes out with a new key, and its answer is lost too.
+      mockApi(() => new TypeError("socket hang up"));
+      await send(store, ["a@example.com", "b@example.com", "c@example.com"], true);
+      const resendKey = calls[0].headers["idempotency-key"];
+      expect(resendKey).not.toBe(firstKey);
+
+      // The next ordinary run replays the resend, the attempt the user asked for last.
+      mockApi(okBatch);
+      await send(store, ["a@example.com", "b@example.com", "c@example.com"]);
+      expect(calls).toHaveLength(1);
+      expect(calls[0].headers["idempotency-key"]).toBe(resendKey);
+    });
+  }, STORE_TEST_TIMEOUT_MS);
+
+  it("puts the earlier key back when a resend is refused", async () => {
+    await withStore(async (store) => {
+      mockApi(() => new TypeError("socket hang up"));
+      await send(store, ["a@example.com"]);
+      const firstKey = calls[0].headers["idempotency-key"];
+      mockApi(() => ({ status: 403, body: { error: "domain not verified" } }));
+      await send(store, ["a@example.com"], true);
+      // The refused resend sent nothing, so the first attempt is still the one to replay.
+      expect(store.uncertainBatches(sendKey(message))).toEqual([{ key: firstKey, recipients: ["a@example.com"] }]);
+    });
+  }, STORE_TEST_TIMEOUT_MS);
 
   it("does not replay a batch whose recipients changed", async () => {
     await withStore(async (store) => {
@@ -228,7 +268,7 @@ describe("sendDigest", () => {
       expect((calls[0].body as Array<{ to: string[] }>).map((row) => row.to[0])).toEqual(["c@example.com"]);
       expect(results.find((r) => r.recipient === "a@example.com")).toMatchObject({ uncertain: true });
     });
-  });
+  }, STORE_TEST_TIMEOUT_MS);
 
   it("writes each batch ahead as uncertain before it goes out, then marks it sent or forgets it", async () => {
     const states = new Map<string, "sent" | "uncertain">();

@@ -40,8 +40,11 @@ export class HistoryLockError extends Error {
 
 export class HistoryStore {
   private locked = false;
-  /** Rows the current batch's write-ahead created (they did not exist before), per send key. */
-  private writtenAhead = new Map<string, Set<string>>();
+  /**
+   * What the current batch's write-ahead did, per send key: rows it created,
+   * and uncertain rows it gave the new key (with the key they had before).
+   */
+  private writtenAhead = new Map<string, { written: Set<string>; rekeyed: Map<string, string | null> }>();
 
   private constructor(
     private readonly dbPath: string,
@@ -181,8 +184,10 @@ export class HistoryStore {
 
   /**
    * Save the addresses of one batch, so a rerun of the same send skips them.
-   * Writing ahead as uncertain never touches an existing row, so a refused
-   * --resend cannot erase what an earlier run sent.
+   * Writing ahead as uncertain creates rows for new addresses and gives an
+   * uncertain address (sent again with --resend) the new batch's key, which a
+   * refused batch puts back (see forgetRecipients). It never touches a sent
+   * row, so a refused --resend cannot erase what an earlier run sent.
    */
   async recordRecipients(
     sendKey: string,
@@ -190,24 +195,52 @@ export class HistoryStore {
     state: RecipientState = "sent",
     batchKey?: string,
   ) {
-    const ahead = state === "uncertain";
-    const stmt = this.db.prepare(
-      `INSERT OR ${ahead ? "IGNORE" : "REPLACE"} INTO sent_recipients (send_key, recipient, email_id, sent_at, state, batch_key) VALUES (?, ?, ?, ?, ?, ?)`,
-    );
     const now = new Date().toISOString();
-    // Batches go one at a time, so the set only ever holds the current batch.
-    const written = ahead ? new Set<string>() : (this.writtenAhead.get(sendKey) ?? new Set<string>());
-    try {
-      for (const row of rows) {
-        const recipient = row.recipient.toLowerCase();
-        stmt.run([sendKey, recipient, row.id ?? null, now, state, batchKey ?? null]);
-        if (ahead && this.db.getRowsModified() > 0) written.add(recipient);
-        if (!ahead) written.delete(recipient);
+    if (state === "uncertain") {
+      // Batches go one at a time, so these only ever describe the current batch.
+      const written = new Set<string>();
+      const rekeyed = new Map<string, string | null>();
+      const find = this.db.prepare("SELECT state, batch_key FROM sent_recipients WHERE send_key = ? AND recipient = ?");
+      const insert = this.db.prepare(
+        "INSERT INTO sent_recipients (send_key, recipient, email_id, sent_at, state, batch_key) VALUES (?, ?, NULL, ?, 'uncertain', ?)",
+      );
+      const rekey = this.db.prepare("UPDATE sent_recipients SET batch_key = ? WHERE send_key = ? AND recipient = ?");
+      try {
+        for (const row of rows) {
+          const recipient = row.recipient.toLowerCase();
+          find.bind([sendKey, recipient]);
+          const existing = find.step() ? find.get() : null;
+          find.reset();
+          if (!existing) {
+            insert.run([sendKey, recipient, now, batchKey ?? null]);
+            written.add(recipient);
+          } else if (existing[0] === "uncertain") {
+            rekeyed.set(recipient, existing[1] === null ? null : String(existing[1]));
+            rekey.run([batchKey ?? null, sendKey, recipient]);
+          }
+        }
+      } finally {
+        find.free();
+        insert.free();
+        rekey.free();
       }
-    } finally {
-      stmt.free();
+      this.writtenAhead.set(sendKey, { written, rekeyed });
+    } else {
+      const stmt = this.db.prepare(
+        "INSERT OR REPLACE INTO sent_recipients (send_key, recipient, email_id, sent_at, state, batch_key) VALUES (?, ?, ?, ?, ?, ?)",
+      );
+      const pending = this.writtenAhead.get(sendKey);
+      try {
+        for (const row of rows) {
+          const recipient = row.recipient.toLowerCase();
+          stmt.run([sendKey, recipient, row.id ?? null, now, state, batchKey ?? null]);
+          pending?.written.delete(recipient);
+          pending?.rekeyed.delete(recipient);
+        }
+      } finally {
+        stmt.free();
+      }
     }
-    this.writtenAhead.set(sendKey, written);
     await this.persist();
   }
 
@@ -217,16 +250,23 @@ export class HistoryStore {
    * rows from earlier runs stay as they were.
    */
   async forgetRecipients(sendKey: string, recipients: string[]) {
-    const written = this.writtenAhead.get(sendKey);
-    const stmt = this.db.prepare("DELETE FROM sent_recipients WHERE send_key = ? AND recipient = ?");
+    const pending = this.writtenAhead.get(sendKey);
+    const remove = this.db.prepare("DELETE FROM sent_recipients WHERE send_key = ? AND recipient = ?");
+    const restore = this.db.prepare("UPDATE sent_recipients SET batch_key = ? WHERE send_key = ? AND recipient = ?");
     try {
       for (const recipient of recipients.map((r) => r.toLowerCase())) {
-        if (!written?.has(recipient)) continue;
-        stmt.run([sendKey, recipient]);
-        written.delete(recipient);
+        if (pending?.written.has(recipient)) {
+          remove.run([sendKey, recipient]);
+          pending.written.delete(recipient);
+        } else if (pending?.rekeyed.has(recipient)) {
+          // The refused batch sent nothing, so the earlier attempt's key is the one that counts.
+          restore.run([pending.rekeyed.get(recipient) ?? null, sendKey, recipient]);
+          pending.rekeyed.delete(recipient);
+        }
       }
     } finally {
-      stmt.free();
+      remove.free();
+      restore.free();
     }
     await this.persist();
   }
@@ -252,17 +292,6 @@ export class HistoryStore {
       stmt.free();
     }
     return [...batches].map(([key, recipients]) => ({ key, recipients }));
-  }
-
-  /** Clear uncertain addresses SMTPfast showed were never sent, so this run can send them. */
-  async releaseUncertain(sendKey: string, recipients: string[]) {
-    const stmt = this.db.prepare("DELETE FROM sent_recipients WHERE send_key = ? AND recipient = ? AND state = 'uncertain'");
-    try {
-      for (const recipient of recipients) stmt.run([sendKey, recipient.toLowerCase()]);
-    } finally {
-      stmt.free();
-    }
-    await this.persist();
   }
 
   /** The broadcast created for this exact send, if any. */

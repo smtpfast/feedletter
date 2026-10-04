@@ -304,7 +304,6 @@ program
             forget: (recipients) => store.forgetRecipients(key, recipients),
             // --resend sends everyone again, so it replays nothing.
             uncertainBatches: () => (options.resend ? [] : store.uncertainBatches(key)),
-            release: (recipients) => store.releaseUncertain(key, recipients),
           };
           const out = await sendDigest(config, message, checked.valid, { checkpoint });
           if (out.some((r) => r.ok || r.alreadySent)) await store.recordIssue(issue);

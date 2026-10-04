@@ -4,8 +4,8 @@
 
 ### Changed
 
-- `send` gives each batch an `Idempotency-Key` made from the issue and its addresses. A 5xx or a lost answer is retried twice with the same key, which SMTPfast answers with its first answer, so a retry never sends twice.
-- A rerun replays a batch left uncertain by an earlier run with its key (within SMTPfast's 24 hour window): a batch that went out is marked sent, and one that never did is sent now. Uncertain batches that cannot be replayed are still skipped.
+- `send` gives each batch a random `Idempotency-Key`, saved in the history file before the batch goes out. A 5xx or a lost answer is retried twice with the same key, which SMTPfast answers with its first answer, so a retry never sends twice. A refusal after such an attempt counts as uncertain, not as "not sent".
+- A rerun replays a batch left uncertain by an earlier run with its key (within SMTPfast's 24 hour window): a batch that went out is marked sent, and one that never did is sent now. Uncertain batches that cannot be replayed are still skipped. `--resend` uses new keys, so it really sends again.
 - The history file gets a `batch_key` column on first open. Older uncertain rows have no key and are skipped as before.
 
 ## [0.3.1] - 2026-10-03
