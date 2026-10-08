@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
+import { DAILY_DEV_FEEDS, dailyDevFeedLabel, loadDailyDevFeed, parseDailyDevFeed } from "./dailydev.js";
 import { HistoryStore, itemHistoryKey } from "./history.js";
 import { startPreviewServer } from "./preview.js";
 import { renderHtml, renderText } from "./render.js";
@@ -35,7 +36,7 @@ const program = new Command();
 
 program
   .name("feedletter")
-  .description("Generate email digests from RSS feeds or local Markdown content.")
+  .description("Generate email digests from RSS feeds, local Markdown content or daily.dev.")
   .version(version);
 
 async function readIssue(dir: string): Promise<DigestIssue> {
@@ -62,6 +63,8 @@ program
   .description("Build email.html, email.txt, and issue.json from a content source.")
   .option("--rss <url>", "RSS or Atom feed URL")
   .option("--content <dir>", "Local Markdown/MDX content directory")
+  .option("--dailydev <feed>", `A daily.dev feed: ${DAILY_DEV_FEEDS}. Needs DAILY_DEV_TOKEN`)
+  .option("--dailydev-link <target>", "Link daily.dev items to the article or the discussion", "article")
   .option("--base-url <url>", "Base URL for relative Markdown slugs")
   .option("--out <dir>", "Output directory", "dist/feedletter")
   .option("--limit <number>", "Number of items to include", "5")
@@ -82,7 +85,11 @@ program
   .action(async (options) => {
     let history: HistoryStore | undefined;
     try {
-      requireOneSource(options.rss, options.content);
+      requireOneSource(options.rss, options.content, options.dailydev);
+      const dailyDevFeed = options.dailydev ? parseDailyDevFeed(options.dailydev) : undefined;
+      if (options.dailydevLink !== "article" && options.dailydevLink !== "discussion") {
+        throw new Error("--dailydev-link must be article or discussion.");
+      }
       const limit = Number.parseInt(options.limit, 10);
       if (!Number.isFinite(limit) || limit < 1) throw new Error("--limit must be a positive number.");
       if (options.ai && options.agentCommand) {
@@ -92,17 +99,26 @@ program
       const loadLimit = options.history && !options.includeSeen ? Math.max(limit * 4, limit + 20) : limit;
       const loadedItems = options.rss
         ? await loadRssFeed({ url: options.rss, limit: loadLimit })
-        : await loadContentDirectory({
-            dir: path.resolve(options.content),
-            baseUrl: options.baseUrl,
-            limit: loadLimit,
-          });
+        : dailyDevFeed
+          ? await loadDailyDevFeed({
+              feed: dailyDevFeed,
+              limit: loadLimit,
+              token: process.env.DAILY_DEV_TOKEN ?? "",
+              link: options.dailydevLink,
+            })
+          : await loadContentDirectory({
+              dir: path.resolve(options.content),
+              baseUrl: options.baseUrl,
+              limit: loadLimit,
+            });
 
       if (loadedItems.length === 0) {
         throw new Error(
           options.rss
             ? `The feed at ${options.rss} has no items yet.`
-            : `No .md or .mdx files found in ${path.resolve(options.content)}.`,
+            : dailyDevFeed
+              ? `The daily.dev feed "${options.dailydev}" has no posts.`
+              : `No .md or .mdx files found in ${path.resolve(options.content)}.`,
         );
       }
 
@@ -131,7 +147,8 @@ program
           : undefined;
 
       const sourceLabel =
-        options.sourceLabel ?? (options.rss ? hostLabel(items[0]?.source ?? options.rss, "Feed") : "Local content");
+        options.sourceLabel ??
+        (options.rss ? hostLabel(items[0]?.source ?? options.rss, "Feed") : dailyDevFeed ? dailyDevFeedLabel(dailyDevFeed) : "Local content");
       const fallback = buildFallbackIssue(
         options.title,
         options.description,
@@ -227,6 +244,7 @@ program
         history: options.history,
         agentCommand: options.agentCommand,
         agentTimeoutMs,
+        dailyDevToken: process.env.DAILY_DEV_TOKEN?.trim() || undefined,
       });
       console.log(`Feedletter Studio running at http://${options.host}:${port}`);
     } catch (error) {

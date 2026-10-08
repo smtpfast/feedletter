@@ -13,6 +13,7 @@ let mock: Server;
 let base: string;
 let mockUrl: string;
 let contentDir: string;
+let dailyDevStudio: Server | undefined;
 
 // A stand-in for the SMTPfast API so the studio's own fetch has something to hit
 // without stubbing global fetch (which the test itself uses to call the studio).
@@ -32,6 +33,15 @@ function startMock(): Promise<Server> {
         res.end(JSON.stringify(payload));
       };
       if (req.method === "GET" && req.url === "/v1/domains") return json(200, [{ id: "dom_1", domain: "example.com", status: "verified" }]);
+      if (req.method === "GET" && req.url?.startsWith("/public/v1/feeds/popular")) {
+        if (req.headers.authorization !== "Bearer dda_studio") return json(401, { error: "unauthorized" });
+        return json(200, {
+          data: [
+            { id: "p1", title: "Popular one", url: "https://example.com/p1", commentsPermalink: "https://daily.dev/posts/p1", summary: "First", source: { name: "Example" } },
+            { id: "s1", title: "", url: null, commentsPermalink: "https://daily.dev/posts/s1", summary: null, source: { name: "A squad" } },
+          ],
+        });
+      }
       if (req.method === "POST" && req.url === "/v1/emails/batch") {
         const rows = body as Array<{ subject?: string }>;
         const reply = () => json(200, { batch_id: "b1", emails: rows.map((_, i) => ({ id: `email_${i}`, status: "queued" })) });
@@ -116,6 +126,7 @@ beforeAll(async () => {
 
 afterAll(async () => {
   await new Promise<void>((r) => studio.close(() => r()));
+  if (dailyDevStudio) await new Promise<void>((r) => dailyDevStudio.close(() => r()));
   await new Promise<void>((r) => mock.close(() => r()));
   await rm(contentDir, { recursive: true, force: true });
 });
@@ -159,6 +170,46 @@ describe("studio server", () => {
       req.end();
     });
     expect(status).toBe(403);
+  });
+
+  it("asks for a token before it loads daily.dev", async () => {
+    const { status, data } = await post("/api/load", { type: "dailydev", feed: "popular", limit: 5 });
+    expect(status).toBe(400);
+    expect(String(data.error)).toContain("DAILY_DEV_TOKEN");
+  });
+
+  it("loads daily.dev with the server's token, which the page never sees", async () => {
+    dailyDevStudio = await startStudioServer({
+      host: "127.0.0.1",
+      port: 0,
+      history: false,
+      dailyDevToken: "dda_studio",
+      dailyDevApiUrl: `${mockUrl}/public/v1`,
+    });
+    const ddBase = `http://127.0.0.1:${(dailyDevStudio.address() as AddressInfo).port}`;
+
+    const page = await (await fetch(`${ddBase}/`)).text();
+    expect(page).toContain('id="segDailyDev"');
+    // The config is embedded as an escaped JSON string.
+    expect(page).toContain('dailyDevReady\\":true');
+    expect(page).not.toContain("dda_studio");
+
+    const res = await fetch(`${ddBase}/api/load`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "dailydev", feed: "popular:kubernetes", link: "discussion", limit: 5 }),
+    });
+    const data = (await res.json()) as { items: Array<{ title: string; url: string }>; sourceLabel: string };
+    expect(res.status).toBe(200);
+    expect(data.items).toEqual([expect.objectContaining({ title: "Popular one", url: "https://daily.dev/posts/p1" })]);
+    expect(data.sourceLabel).toBe("Popular on daily.dev: kubernetes");
+
+    const bad = await fetch(`${ddBase}/api/load`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ type: "dailydev", feed: "trending", limit: 5 }),
+    });
+    expect(bad.status).toBe(400);
   });
 
   it("loads items from a content directory", async () => {
