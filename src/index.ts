@@ -1,5 +1,7 @@
 export { applyDigestPatch, buildDigestPrompt, enrichIssueWithAi, buildFallbackIssue } from "./ai.js";
 export { loadContentDirectory } from "./content.js";
+export { dailyDevFeedLabel, loadDailyDevFeed, parseDailyDevFeed } from "./dailydev.js";
+export type { DailyDevFeed, DailyDevLink } from "./dailydev.js";
 export { HistoryStore, itemHistoryKey } from "./history.js";
 export { startPreviewServer } from "./preview.js";
 export { renderHtml, renderText } from "./render.js";

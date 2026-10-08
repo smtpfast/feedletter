@@ -1,13 +1,13 @@
 # Feedletter
 
-Generate clean email digests from RSS feeds or local Markdown content.
+Generate clean email digests from RSS feeds, local Markdown content or daily.dev.
 
 ![Feedletter Studio: pick a source, curate items, live-preview the email, and send with SMTPfast](docs/studio.png)
 
 Feedletter is a small open source CLI for teams that publish content and want a
 fast path from "new posts exist" to "sent newsletter." It can read an RSS/Atom
-feed or a local Markdown/MDX directory, select recent items, and write
-email-safe HTML, plain text, and structured JSON.
+feed, a local Markdown/MDX directory or a [daily.dev](https://daily.dev) feed,
+select recent items, and write email-safe HTML, plain text, and structured JSON.
 
 The `feedletter studio` command opens a local browser tool where you pick which
 items to include, reorder and edit them, tweak the subject and intro, watch a
@@ -22,6 +22,7 @@ agent command such as Claude Code, Codex, or your own script.
 
 - browser studio: click-ops curation, inline editing, live preview, one-click send
 - RSS 2.0, RSS 1.0 (RDF), and Atom feeds, plus Markdown/MDX folders
+- daily.dev feeds: popular posts, the most discussed, a tag, a search, your For You feed or your bookmarks
 - feed autodiscovery: paste a blog's home page and Feedletter follows the feed it links to
 - polished email-safe HTML and plain-text output
 - per-recipient unsubscribe links via SMTPfast (`{{unsubscribe_url}}`)
@@ -80,6 +81,32 @@ feedletter build \
   --limit 5
 ```
 
+Build from daily.dev, with a [personal access token](https://daily.dev/settings/api):
+
+```bash
+export DAILY_DEV_TOKEN="dda_..."
+feedletter build \
+  --dailydev popular:kubernetes,docker \
+  --title "This week in Kubernetes" \
+  --limit 6
+```
+
+`--dailydev` takes one of these feeds:
+
+| Feed | What you get |
+| --- | --- |
+| `popular` or `popular:<tags>` | Popular posts, optionally for comma-separated tags |
+| `discussed` or `discussed:<tag>` | The posts with the most comments in the last 7 days |
+| `tag:<tag>` | The latest posts for a tag |
+| `search:<words>` | Posts from the last 7 days that match the words |
+| `foryou` | Your personal For You feed |
+| `bookmarks` | Your bookmarks |
+
+Each item links to the original article. Use `--dailydev-link discussion` to
+link to the daily.dev discussion instead. Posts shared in a squad have no title
+in the public API, so Feedletter leaves them out. The token is sent only to
+`api.daily.dev`, and Feedletter does not follow redirects from it.
+
 Preview the generated email:
 
 ```bash
@@ -96,8 +123,10 @@ Every command also supports `--help`. The top-level command supports `--version`
 
 | Flag | Default | Description |
 | --- | --- | --- |
-| `--rss <url>` | — | RSS or Atom feed URL. Provide this or `--content`. |
-| `--content <dir>` | — | Local Markdown/MDX content directory. Provide this or `--rss`. |
+| `--rss <url>` | — | RSS or Atom feed URL. Provide one of `--rss`, `--content` or `--dailydev`. |
+| `--content <dir>` | — | Local Markdown/MDX content directory. |
+| `--dailydev <feed>` | — | A daily.dev feed (see above). Needs `DAILY_DEV_TOKEN`. |
+| `--dailydev-link <target>` | `article` | Link daily.dev items to the `article` or the `discussion`. |
 | `--base-url <url>` | — | Base URL for relative Markdown slugs. |
 | `--out <dir>` | `dist/feedletter` | Output directory for the generated issue. |
 | `--limit <number>` | `5` | Number of items to include. |
@@ -180,9 +209,13 @@ feedletter studio
 # or preload a source: feedletter studio --content ./content/blog --base-url https://example.com
 ```
 
+To use daily.dev in the studio, start it with `DAILY_DEV_TOKEN` set. The token
+stays on the local server; the page never sees it. You can also open
+`/?dailydev=popular:kubernetes` to load a feed straight away.
+
 In the studio you can:
 
-- load items from an RSS/Atom feed or a Markdown directory
+- load items from an RSS/Atom feed, a Markdown directory or a daily.dev feed
 - start from a filled-in draft: the subject, preheader, and intro are written
   for you the moment items load
 - include or drop each item, reorder by drag or arrows, and edit titles and

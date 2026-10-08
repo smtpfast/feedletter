@@ -4,6 +4,7 @@ import { isIP } from "node:net";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
+import { DAILY_DEV_TOKEN_URL, dailyDevFeedLabel, loadDailyDevFeed, parseDailyDevFeed } from "./dailydev.js";
 import { HistoryLockError, HistoryStore, itemHistoryKey } from "./history.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
@@ -39,6 +40,10 @@ export interface StudioOptions {
   history?: boolean;
   agentCommand?: string;
   agentTimeoutMs?: number;
+  /** A daily.dev token from the environment. It stays on the server; the page never sees it. */
+  dailyDevToken?: string;
+  /** Tests point this at a local server. */
+  dailyDevApiUrl?: string;
   /** Waits before retrying a batch with an unknown outcome (tests set them to 0). */
   retryDelaysMs?: number[];
 }
@@ -204,8 +209,28 @@ function issueFromDraft(draft: Record<string, unknown>): DigestIssue {
 
 async function handleLoad(req: IncomingMessage, res: ServerResponse, ctx: ServerContext) {
   const body = await readJson<Record<string, unknown>>(req);
-  const type = body.type === "content" ? "content" : "rss";
+  const type = body.type === "content" || body.type === "dailydev" ? body.type : "rss";
   const limit = Math.min(Math.max(Number.parseInt(String(body.limit ?? "10"), 10) || 10, 1), 50);
+
+  if (type === "dailydev") {
+    if (!ctx.dailyDevToken) {
+      return sendJson(res, 400, { error: `Start the studio with DAILY_DEV_TOKEN set. Create a token at ${DAILY_DEV_TOKEN_URL}.` });
+    }
+    let feed;
+    try {
+      feed = parseDailyDevFeed(toStringField(body.feed));
+    } catch (error) {
+      return sendJson(res, 400, { error: (error as Error).message });
+    }
+    const items = await loadDailyDevFeed({
+      feed,
+      limit,
+      token: ctx.dailyDevToken,
+      link: body.link === "discussion" ? "discussion" : "article",
+      apiUrl: ctx.dailyDevApiUrl,
+    });
+    return sendJson(res, 200, { items: withSeen(items, ctx), sourceLabel: dailyDevFeedLabel(feed) });
+  }
 
   if (type === "rss") {
     const url = toStringField(body.rss).trim();
@@ -530,6 +555,7 @@ export async function startStudioServer(options: StudioOptions) {
     signupUrl: SMTPFAST_SIGNUP_URL,
     unsubscribePlaceholder: UNSUBSCRIBE_PLACEHOLDER,
     historyEnabled: Boolean(ctx.historyStore),
+    dailyDevReady: Boolean(options.dailyDevToken),
   });
 
   const hostGuard = await bindNeedsHostGuard(options.host);

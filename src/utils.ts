@@ -138,11 +138,12 @@ export async function writeOutputFile(outDir: string, fileName: string, content:
   await writeFile(path.join(outDir, fileName), content, "utf8");
 }
 
-export function requireOneSource(rss?: string, contentDir?: string) {
-  if (!rss && !contentDir) {
-    throw new Error("Provide one source: --rss <url> or --content <dir>.");
+export function requireOneSource(rss?: string, contentDir?: string, dailydev?: string) {
+  const given = [rss && "--rss", contentDir && "--content", dailydev && "--dailydev"].filter(Boolean);
+  if (given.length === 0) {
+    throw new Error("Provide one source: --rss <url>, --content <dir> or --dailydev <feed>.");
   }
-  if (rss && contentDir) {
-    throw new Error("Use either --rss or --content, not both.");
+  if (given.length > 1) {
+    throw new Error(`Use one source, not ${given.join(" and ")}.`);
   }
 }

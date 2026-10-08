@@ -1,5 +1,16 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- `--dailydev <feed>` builds an issue from daily.dev: `popular[:tags]`, `discussed[:tag]`, `tag:<tag>`, `search:<words>`, `foryou` or `bookmarks`. It needs a personal access token in `DAILY_DEV_TOKEN`. Items link to the article, or to the daily.dev discussion with `--dailydev-link discussion`.
+- The studio has a daily.dev source when it starts with `DAILY_DEV_TOKEN` set. The token stays on the server. `/?dailydev=<feed>` loads a feed straight away.
+
+### Changed
+
+- The studio's source buttons are now "RSS", "Markdown" and "daily.dev".
+
 ## [0.4.0] - 2026-10-04
 
 ### Changed

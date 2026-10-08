@@ -5,6 +5,8 @@ export interface StudioPageConfig {
   signupUrl: string;
   unsubscribePlaceholder: string;
   historyEnabled: boolean;
+  /** The server has a daily.dev token, so the daily.dev source can load. */
+  dailyDevReady: boolean;
 }
 
 export function renderStudioPage(config: StudioPageConfig): string {
@@ -46,8 +48,9 @@ export function renderStudioPage(config: StudioPageConfig): string {
         <form id="sourcePanel" class="panel" novalidate>
           <h2>1. Source</h2>
           <div class="seg" role="group" aria-label="Source type">
-            <button id="segRss" class="seg-btn active" type="button" aria-pressed="true">RSS / Atom</button>
-            <button id="segContent" class="seg-btn" type="button" aria-pressed="false">Markdown dir</button>
+            <button id="segRss" class="seg-btn active" type="button" aria-pressed="true">RSS</button>
+            <button id="segContent" class="seg-btn" type="button" aria-pressed="false">Markdown</button>
+            <button id="segDailyDev" class="seg-btn" type="button" aria-pressed="false">daily.dev</button>
           </div>
           <div id="rssFields">
             <label class="field">
@@ -64,6 +67,31 @@ export function renderStudioPage(config: StudioPageConfig): string {
               <span>Base URL (for relative links)</span>
               <input id="baseUrl" type="url" placeholder="https://example.com" />
             </label>
+          </div>
+          <div id="dailyDevFields" hidden>
+            <label class="field">
+              <span>Feed</span>
+              <select id="ddFeed">
+                <option value="popular">Popular</option>
+                <option value="discussed">Most discussed this week</option>
+                <option value="tag">Latest for a tag</option>
+                <option value="search">Search this week's posts</option>
+                <option value="foryou">My For You feed</option>
+                <option value="bookmarks">My bookmarks</option>
+              </select>
+            </label>
+            <label id="ddValueField" class="field">
+              <span id="ddValueLabel">Tags <em>(optional, comma separated)</em></span>
+              <input id="ddValue" type="text" spellcheck="false" placeholder="kubernetes, docker" />
+            </label>
+            <label class="field">
+              <span>Each item links to</span>
+              <select id="ddLink">
+                <option value="article">The article</option>
+                <option value="discussion">The daily.dev discussion</option>
+              </select>
+            </label>
+            <p id="ddTokenHint" class="muted small" hidden>Start the studio with <code>DAILY_DEV_TOKEN</code> set to load daily.dev. Create a token at daily.dev/settings/api.</p>
           </div>
           <label class="field">
             <span>How many to pull</span>
@@ -117,7 +145,7 @@ export function renderStudioPage(config: StudioPageConfig): string {
             <div class="empty start">
               <strong>Start with a source</strong>
               <ol>
-                <li>Paste a feed URL or a blog's home page, or pick a Markdown folder.</li>
+                <li>Paste a feed URL or a blog's home page, pick a Markdown folder, or pick a daily.dev feed.</li>
                 <li>Untick, reorder, and edit the items here.</li>
                 <li>Check the preview, send a test, then send with SMTPfast.</li>
               </ol>
@@ -472,14 +500,41 @@ $("statusPill").addEventListener("click", ()=>{ $("statusPill").hidden = true; }
 // ---- source toggle ----
 $("segRss").onclick = () => switchSource("rss");
 $("segContent").onclick = () => switchSource("content");
+$("segDailyDev").onclick = () => switchSource("dailydev");
+const SOURCES = { rss:["segRss","rssFields"], content:["segContent","contentFields"], dailydev:["segDailyDev","dailyDevFields"] };
 function switchSource(type){
   state.sourceType = type;
-  $("segRss").classList.toggle("active", type==="rss");
-  $("segContent").classList.toggle("active", type==="content");
-  $("segRss").setAttribute("aria-pressed", String(type==="rss"));
-  $("segContent").setAttribute("aria-pressed", String(type==="content"));
-  $("rssFields").hidden = type!=="rss";
-  $("contentFields").hidden = type!=="content";
+  for(const [name,[btn,fields]] of Object.entries(SOURCES)){
+    $(btn).classList.toggle("active", type===name);
+    $(btn).setAttribute("aria-pressed", String(type===name));
+    $(fields).hidden = type!==name;
+  }
+}
+$("ddTokenHint").hidden = cfg.dailyDevReady;
+// What the text box means for each daily.dev feed; feeds without one hide it.
+const DD_VALUE = {
+  popular:{ label:"Tags <em>(optional, comma separated)</em>", placeholder:"kubernetes, docker" },
+  discussed:{ label:"Tag <em>(optional)</em>", placeholder:"rust" },
+  tag:{ label:"Tag", placeholder:"kubernetes" },
+  search:{ label:"Search words", placeholder:"postgres replication" },
+};
+function syncDailyDevValue(){
+  const v = DD_VALUE[$("ddFeed").value];
+  $("ddValueField").hidden = !v;
+  if(v){ $("ddValueLabel").innerHTML = v.label; $("ddValue").placeholder = v.placeholder; }
+}
+$("ddFeed").addEventListener("change", syncDailyDevValue);
+function dailyDevSpec(){
+  const feed = $("ddFeed").value; const value = $("ddValue").value.trim();
+  return DD_VALUE[feed] && value ? feed + ":" + value : feed;
+}
+function setDailyDevSpec(spec){
+  const colon = spec.indexOf(":");
+  const feed = (colon === -1 ? spec : spec.slice(0, colon)).trim().toLowerCase();
+  if(![...$("ddFeed").options].some((o)=>o.value===feed)) return false;
+  $("ddFeed").value = feed; $("ddValue").value = colon === -1 ? "" : spec.slice(colon + 1).trim();
+  syncDailyDevValue();
+  return true;
 }
 if(cfg.defaultContentDir){ $("contentDir").value = cfg.defaultContentDir; }
 
@@ -491,12 +546,16 @@ async function load(){
   try{
     const body = state.sourceType==="rss"
       ? { type:"rss", rss:$("rssUrl").value, limit:$("limit").value }
-      : { type:"content", content:$("contentDir").value, baseUrl:$("baseUrl").value, limit:$("limit").value };
+      : state.sourceType==="dailydev"
+        ? { type:"dailydev", feed:dailyDevSpec(), link:$("ddLink").value, limit:$("limit").value }
+        : { type:"content", content:$("contentDir").value, baseUrl:$("baseUrl").value, limit:$("limit").value };
     const res = await fetch("/api/load",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
     const data = await res.json();
     if(!res.ok){ throw new Error(data.error||"Load failed"); }
     if(!data.items || data.items.length===0){
-      throw new Error(state.sourceType==="rss" ? "That feed has no items yet. Check that it is the right feed." : "No .md or .mdx files found in that folder.");
+      throw new Error(state.sourceType==="rss" ? "That feed has no items yet. Check that it is the right feed."
+        : state.sourceType==="dailydev" ? "daily.dev has no posts for that feed. Try another tag or fewer search words."
+        : "No .md or .mdx files found in that folder.");
     }
     state.sourceLabel = data.sourceLabel || "Digest";
     state.items = (data.items||[]).map((it)=>({ ...it, included: !it.seen, _id:++uid }));
@@ -504,7 +563,10 @@ async function load(){
     renderItems(); schedulePreview(); enableSend(); collapseSource();
     const seenCount = state.items.filter((i)=>i.seen).length;
     setStatus(state.items.length + " loaded" + (seenCount ? " · " + seenCount + " already sent" : ""), "ok");
-  }catch(e){ err.textContent = e.message; err.hidden = false; setStatus("Load failed","err"); $("rssUrl").focus(); }
+  }catch(e){
+    err.textContent = e.message; err.hidden = false; setStatus("Load failed","err");
+    $(state.sourceType==="rss" ? "rssUrl" : state.sourceType==="dailydev" ? "ddFeed" : "contentDir").focus();
+  }
   finally{ btn.disabled = false; btn.textContent = "Load items"; }
 }
 function defaultSubject(){
@@ -1043,11 +1105,16 @@ try{ savedMode = localStorage.getItem("feedletter.sendMode")==="list" ? "list" :
 setMode(savedMode);
 updateRecipientInfo();
 
-// Deep-link a source: /?feed=<url> or /?dir=<path>&base=<url>
+// Deep-link a source: /?feed=<url>, /?dir=<path>&base=<url> or /?dailydev=<feed>
 (function seedFromQuery(){
   const q = new URLSearchParams(location.search);
-  const feed = q.get("feed"); const dir = q.get("dir");
+  const feed = q.get("feed"); const dir = q.get("dir"); const dd = q.get("dailydev");
   if(feed){ switchSource("rss"); $("rssUrl").value = feed; load(); }
+  else if(dd){
+    switchSource("dailydev");
+    if(!setDailyDevSpec(dd)){ $("loadError").textContent = 'Unknown daily.dev feed "' + dd + '". Pick one from the list.'; $("loadError").hidden = false; }
+    else if(cfg.dailyDevReady) load();
+  }
   else if(dir){ switchSource("content"); $("contentDir").value = dir; if(q.get("base")) $("baseUrl").value = q.get("base"); load(); }
 })();
 `;
