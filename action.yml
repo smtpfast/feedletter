@@ -1,0 +1,106 @@
+name: Feedletter
+description: Build a newsletter from an RSS feed or Markdown content and send it with SMTPfast.
+
+inputs:
+  rss:
+    description: RSS or Atom feed URL. Provide this or content.
+    required: false
+  content:
+    description: Local Markdown/MDX content directory. Provide this or rss.
+    required: false
+  base-url:
+    description: Base URL for relative Markdown slugs.
+    required: false
+  title:
+    description: Digest subject and title.
+    required: false
+    default: Latest updates
+  description:
+    description: Intro copy displayed before the item list.
+    required: false
+  limit:
+    description: Number of items to include.
+    required: false
+    default: "5"
+  out:
+    description: Output directory for the generated issue.
+    required: false
+    default: dist/newsletter
+  from:
+    description: Verified sender address, e.g. "Weekly <news@yourdomain.com>".
+    required: true
+  to:
+    description: Recipients separated by commas, spaces, or newlines.
+    required: false
+  to-file:
+    description: File containing one recipient per line (# comments allowed).
+    required: false
+  instructions:
+    description: Markdown file with voice, audience, or editorial instructions.
+    required: false
+  smtpfast-api-key:
+    description: SMTPfast API key.
+    required: true
+  no-history:
+    description: Disable history tracking.
+    required: false
+    default: "false"
+
+outputs:
+  sent:
+    description: "true if an issue was sent, false otherwise"
+    value: ${{ steps.send.outcome == 'success' }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install feedletter
+      shell: bash
+      run: npm install -g feedletter@latest
+
+    - name: Build the issue
+      shell: bash
+      run: |
+        args=(build --out "${{ inputs.out }}" --limit "${{ inputs.limit }}" --title "${{ inputs.title }}")
+
+        if [ -n "${{ inputs.rss }}" ]; then
+          args+=(--rss "${{ inputs.rss }}")
+        elif [ -n "${{ inputs.content }}" ]; then
+          args+=(--content "${{ inputs.content }}")
+        else
+          echo "::error::Provide either rss or content input."
+          exit 1
+        fi
+
+        if [ -n "${{ inputs.base-url }}" ]; then args+=(--base-url "${{ inputs.base-url }}"); fi
+        if [ -n "${{ inputs.description }}" ]; then args+=(--description "${{ inputs.description }}"); fi
+        if [ -n "${{ inputs.instructions }}" ]; then args+=(--instructions "${{ inputs.instructions }}"); fi
+        if [ "${{ inputs.no-history }}" = "true" ]; then args+=(--no-history); fi
+
+        feedletter "${args[@]}"
+
+    - name: Check for a new issue
+      id: ready
+      shell: bash
+      run: |
+        if [ -f "${{ inputs.out }}/issue.json" ]; then
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "ready=false" >> "$GITHUB_OUTPUT"
+          echo "No new items to send."
+        fi
+
+    - name: Send with SMTPfast
+      id: send
+      if: steps.ready.outputs.ready == 'true'
+      shell: bash
+      env:
+        SMTPFAST_API_KEY: ${{ inputs.smtpfast-api-key }}
+      run: |
+        args=(send --dir "${{ inputs.out }}" --from "${{ inputs.from }}")
+
+        if [ -n "${{ inputs.to }}" ]; then args+=(--to "${{ inputs.to }}"); fi
+        if [ -n "${{ inputs.to-file }}" ]; then args+=(--to-file "${{ inputs.to-file }}"); fi
+        if [ "${{ inputs.no-history }}" = "true" ]; then args+=(--no-history); fi
+
+        feedletter "${args[@]}"

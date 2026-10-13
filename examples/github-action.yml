@@ -1,0 +1,48 @@
+# Copy this into .github/workflows/newsletter.yml in your own repo.
+#
+# Setup:
+#   1. Add a repository secret SMTPFAST_API_KEY (SMTPfast dashboard -> API keys).
+#   2. Put your recipients in recipients.txt (one email per line, # for comments).
+#   3. The job commits .feedletter/feedletter.sqlite back so the same post is
+#      never sent twice across runs.
+
+name: Newsletter
+
+on:
+  schedule:
+    - cron: "0 9 * * 1" # every Monday at 09:00 UTC
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+
+      - name: Run Feedletter
+        id: feedletter
+        uses: ./
+        with:
+          rss: https://your-blog.example.com/rss.xml
+          title: "This week from the blog"
+          limit: "6"
+          out: dist/newsletter
+          from: "Weekly <news@yourdomain.com>"
+          to-file: recipients.txt
+          smtpfast-api-key: ${{ secrets.SMTPFAST_API_KEY }}
+
+      - name: Save send history
+        if: steps.feedletter.outputs.sent == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -f .feedletter/feedletter.sqlite
+          git commit -m "Record newsletter send" || echo "nothing to commit"
+          git push
