@@ -1,5 +1,21 @@
 # Changelog
 
+## [Unreleased]
+
+### Security
+
+- Markdown front matter is read as data only. A file that starts with `---js` or `---javascript` used to run its front matter as JavaScript when `build --content` or the studio read the folder; it is now refused with an error naming the file. YAML and JSON front matter work as before.
+- The studio API needs a token that is new every time the studio starts. It is printed in the link (`http://127.0.0.1:4180/#token=...`), never written into the page, and sent by the page with every request, so another program or user on the same machine can no longer read your Markdown files or use your AI key or writer through the studio. Open the printed link; a bookmark without the token cannot load or send.
+- `send` can store recipients in the history file as keyed hashes (HMAC-SHA256) instead of addresses: set `FEEDLETTER_HISTORY_KEY` to a long random value. Plain addresses already in the file are turned into hashes the next time it is written. Without the key, `send` and the studio warn that addresses are stored in plain text. With hashes in the file, a run without the key, or with another key, stops instead of sending again.
+- The GitHub Actions example no longer sends an issue twice after a partly failed send, and no longer commits the subscriber list: it saves the history after every attempt, resumes the unfinished issue, checks out the branch head on a re-run, runs one at a time, pins the Feedletter version, reads recipients from a secret, and says the repository must be private. If you copied the old example, copy it again.
+- `--api-key-file <path>` reads the SMTPfast key from a file. `--api-key` is deprecated: other users on the machine can read it in the process list. It still works, with a warning.
+- An uncertain batch is replayed only while its first attempt is less than 23 hours old, inside SMTPfast's 24 hour key window. An older one stays uncertain and `send` reports it.
+- The external writer (`--agent-command`) runs in an empty temporary folder with only the environment it needs; Feedletter's own keys are not passed to it. Name more variables with the new `--agent-env`. Codex needs `--skip-git-repo-check` there.
+- SMTPfast calls never follow redirects. A redirect stops the send as not sent.
+- From a public feed, Feedletter no longer follows a redirect or an advertised feed link to a private or local address. A feed is read up to 10 MB, and entities declared in a feed's DOCTYPE are not expanded.
+- Emails link only `http(s)` addresses, so a `javascript:` link in front matter or a saved draft is dropped. The studio's email preview is sandboxed, the studio page cannot be framed by another site, and `preview` checks the `Host` and `Origin` headers like the studio does.
+- Releases install the locked dependencies (`package-lock.json`) without install scripts, and publish from a separate job that installs nothing.
+
 ## [0.5.0] - 2026-10-08
 
 ### Added

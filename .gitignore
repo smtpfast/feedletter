@@ -3,6 +3,8 @@ dist
 demo-output*
 .feedletter
 .env
+.env.*
+!.env.example
 .DS_Store
 coverage
 *.log

@@ -1,12 +1,30 @@
 # Copy this into .github/workflows/newsletter.yml in your own repo to send a
 # recurring newsletter with Feedletter and SMTPfast, no server required.
 #
+# Run it in a PRIVATE repository. The job commits its history file back to the
+# repo, and Actions logs can name addresses that failed. Git keeps every commit,
+# so making the repo private later does not take back what was already pushed.
+#
 # Setup:
-#   1. Add a repository secret SMTPFAST_API_KEY (SMTPfast dashboard -> API keys).
-#   2. Put your recipients in recipients.txt (one email per line, # for comments).
-#   3. Point the build step at your feed or content directory.
-#   4. The job commits .feedletter/feedletter.sqlite back so the same post is
-#      never sent twice across runs.
+#   1. Add these repository secrets (Settings -> Secrets and variables -> Actions):
+#      - SMTPFAST_API_KEY: your SMTPfast API key (dashboard -> API keys).
+#      - FEEDLETTER_HISTORY_KEY: a long random value, for example from
+#        `openssl rand -hex 32`. The history file stores each recipient as a
+#        keyed hash instead of the address. Keep this value: without the same
+#        key a later run cannot tell who already has an issue, so it stops.
+#      - NEWSLETTER_RECIPIENTS: your list, one email per line. It is written to
+#        a temp file outside the repo and never committed. A secret holds up to
+#        48 KB; for a bigger list use `feedletter broadcast` with your SMTPfast
+#        contacts instead.
+#   2. Point the build step at your feed or content directory.
+#   3. Pin FEEDLETTER_VERSION below, and update it on purpose.
+#
+# After every send attempt, a failed one included, the job commits
+# .feedletter/feedletter.sqlite (who was reached, and batches with an unknown
+# outcome). After a failed send it also keeps the issue in dist/newsletter, so
+# the next run (or "Re-run failed jobs") resends that same issue, skipping
+# everyone already reached, instead of building a new one. To drop an
+# unfinished issue instead, delete dist/newsletter from the repo.
 
 name: Newsletter
 
@@ -18,24 +36,56 @@ on:
 permissions:
   contents: write # needed to commit the send history back
 
+# One run at a time: two runs must never send the same issue.
+concurrency:
+  group: newsletter-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  FEEDLETTER_VERSION: "0.6.0"
+
 jobs:
   send:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # "Re-run failed jobs" checks out the first run's commit by default,
+          # which has no record of that run's send. The branch head has it.
+          ref: ${{ github.ref }}
 
       - uses: actions/setup-node@v4
         with:
           node-version: 22.x
 
-      # Build the issue from a feed (or swap --rss for --content ./content).
-      - name: Build the issue
+      - name: Check the secrets
+        env:
+          SMTPFAST_API_KEY: ${{ secrets.SMTPFAST_API_KEY }}
+          FEEDLETTER_HISTORY_KEY: ${{ secrets.FEEDLETTER_HISTORY_KEY }}
+          NEWSLETTER_RECIPIENTS: ${{ secrets.NEWSLETTER_RECIPIENTS }}
         run: |
-          npx feedletter@latest build \
-            --rss https://your-blog.example.com/rss.xml \
-            --title "This week from the blog" \
-            --limit 6 \
-            --out dist/newsletter
+          for name in SMTPFAST_API_KEY FEEDLETTER_HISTORY_KEY NEWSLETTER_RECIPIENTS; do
+            if [ -z "${!name}" ]; then
+              echo "::error::Add the $name repository secret (see the setup notes at the top of this file)."
+              exit 1
+            fi
+          done
+
+      # Build the issue from a feed (or swap --rss for --content ./content).
+      # An issue an earlier run could not finish sending is resent as it is.
+      - name: Build the issue
+        env:
+          FEEDLETTER_HISTORY_KEY: ${{ secrets.FEEDLETTER_HISTORY_KEY }}
+        run: |
+          if [ -f dist/newsletter/issue.json ]; then
+            echo "Resending the unfinished issue in dist/newsletter."
+          else
+            npx --yes "feedletter@$FEEDLETTER_VERSION" build \
+              --rss https://your-blog.example.com/rss.xml \
+              --title "This week from the blog" \
+              --limit 6 \
+              --out dist/newsletter
+          fi
 
       # Nothing new since last run -> issue.json will be absent, so skip sending.
       - name: Check for a new issue
@@ -49,20 +99,40 @@ jobs:
           fi
 
       - name: Send with SMTPfast
+        id: send
         if: steps.issue.outputs.ready == 'true'
         env:
           SMTPFAST_API_KEY: ${{ secrets.SMTPFAST_API_KEY }}
+          FEEDLETTER_HISTORY_KEY: ${{ secrets.FEEDLETTER_HISTORY_KEY }}
+          NEWSLETTER_RECIPIENTS: ${{ secrets.NEWSLETTER_RECIPIENTS }}
         run: |
-          npx feedletter@latest send \
+          recipients="$RUNNER_TEMP/recipients.txt"
+          printf '%s\n' "$NEWSLETTER_RECIPIENTS" > "$recipients"
+          npx --yes "feedletter@$FEEDLETTER_VERSION" send \
             --dir dist/newsletter \
             --from "Weekly <news@yourdomain.com>" \
-            --to-file recipients.txt
+            --to-file "$recipients"
 
       - name: Save send history
-        if: steps.issue.outputs.ready == 'true'
+        # always(): after a failed or cancelled send the history is what tells
+        # the next run who already has the email.
+        if: always() && steps.issue.outputs.ready == 'true'
+        env:
+          SEND_OUTCOME: ${{ steps.send.outcome }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -f .feedletter/feedletter.sqlite
+          if [ "$SEND_OUTCOME" = "success" ]; then
+            git rm -r -q --cached --ignore-unmatch dist/newsletter
+          else
+            # Keep the unfinished issue, so the next run resends it unchanged.
+            git add -f dist/newsletter
+          fi
           git commit -m "Record newsletter send" || echo "nothing to commit"
-          git push
+          for attempt in 1 2 3; do
+            git pull --rebase --quiet && git push && exit 0
+            sleep 5
+          done
+          echo "::error::Could not push the send history. Do not rerun before it is in the repo, or people who already have the email get it again."
+          exit 1

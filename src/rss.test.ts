@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { renderHtml } from "./render.js";
-import { decodeFeedBody, discoverFeedUrl, loadRssFeed } from "./rss.js";
+import { decodeFeedBody, discoverFeedUrl, isPrivateAddress, loadRssFeed } from "./rss.js";
 
 const rssXml = `<?xml version="1.0"?>
 <rss version="2.0">
@@ -34,7 +34,7 @@ const atomXml = `<?xml version="1.0" encoding="utf-8"?>
   </entry>
 </feed>`;
 
-type Route = { body: string | Uint8Array; status?: number; contentType?: string };
+type Route = { body: string | Uint8Array; status?: number; contentType?: string; location?: string };
 const realFetch = globalThis.fetch;
 const calls: Array<{ url: string; init?: RequestInit }> = [];
 
@@ -47,10 +47,10 @@ function serve(routes: Record<string, Route> | Route) {
     const route = "body" in routes ? (routes as Route) : (routes as Record<string, Route>)[url];
     if (!route) return new Response("not found", { status: 404, statusText: "Not Found" });
     const status = route.status ?? 200;
-    return new Response(status === 204 ? null : route.body, {
+    return new Response(status === 204 || route.location ? null : route.body, {
       status,
       statusText: status === 200 ? "OK" : "Error",
-      headers: { "content-type": route.contentType ?? "application/rss+xml" },
+      headers: { "content-type": route.contentType ?? "application/rss+xml", ...(route.location ? { location: route.location } : {}) },
     });
   }) as typeof fetch;
 }
@@ -297,5 +297,92 @@ describe("discoverFeedUrl", () => {
   it("handles attribute order, quotes, and Atom feeds", () => {
     const html = `<link href='https://cdn.example.com/x.css' rel=stylesheet><link type="application/atom+xml" href="feed.atom" rel="alternate">`;
     expect(discoverFeedUrl(html, "https://example.com/blog/")).toBe("https://example.com/blog/feed.atom");
+  });
+});
+
+describe("feed redirects and limits", () => {
+  // Stand-in DNS: one internal name, everything else public.
+  const resolve = async (host: string) => [{ address: host === "internal.example" ? "192.168.1.10" : "93.184.215.14" }];
+
+  it("does not follow a public feed's redirect to a private or local address", async () => {
+    const targets = [
+      "http://127.0.0.1:8080/feed.xml",
+      "http://169.254.169.254/latest/meta-data/",
+      "http://[::1]/feed",
+      "http://[::ffff:10.0.0.5]/feed",
+      "http://10.0.0.5/feed",
+      "http://localhost/feed",
+      "http://internal.example/feed",
+    ];
+    for (const target of targets) {
+      serve({ "https://blog.example.com/feed.xml": { body: "", status: 302, location: target }, [new URL(target).toString()]: { body: rssXml } });
+      await expect(loadRssFeed({ url: "https://blog.example.com/feed.xml", limit: 5, resolve }), target).rejects.toThrow(/a private or local address/);
+      expect(calls.map((call) => call.url)).toEqual(["https://blog.example.com/feed.xml"]);
+    }
+  });
+
+  it("follows a redirect to another public address, checking each hop itself", async () => {
+    serve({
+      "http://blog.example.com/feed": { body: "", status: 301, location: "https://blog.example.com/feed" },
+      "https://blog.example.com/feed": { body: "", status: 308, location: "https://feeds.example.net/rss.xml" },
+      "https://feeds.example.net/rss.xml": { body: rssXml },
+    });
+    const items = await loadRssFeed({ url: "http://blog.example.com/feed", limit: 5, resolve });
+    expect(items).toHaveLength(2);
+    expect(calls.map((call) => call.url)).toEqual(["http://blog.example.com/feed", "https://blog.example.com/feed", "https://feeds.example.net/rss.xml"]);
+    expect(calls.every((call) => call.init?.redirect === "manual")).toBe(true);
+  });
+
+  it("lets a feed you point at a local address move within your network", async () => {
+    serve({
+      "http://127.0.0.1:3000/feed": { body: "", status: 302, location: "http://192.168.1.20/feed.xml" },
+      "http://192.168.1.20/feed.xml": { body: rssXml },
+    });
+    await expect(loadRssFeed({ url: "http://127.0.0.1:3000/feed", limit: 5, resolve })).resolves.toHaveLength(2);
+  });
+
+  it("does not follow a feed link a public page advertises on a private address", async () => {
+    serve({
+      "https://blog.example.com/": {
+        body: '<!doctype html><html><head><link rel="alternate" type="application/rss+xml" href="http://169.254.169.254/feed"></head></html>',
+        contentType: "text/html",
+      },
+      "http://169.254.169.254/feed": { body: rssXml },
+    });
+    await expect(loadRssFeed({ url: "https://blog.example.com/", limit: 5, resolve })).rejects.toThrow(/a private or local address/);
+    expect(calls).toHaveLength(1);
+  });
+
+  it("stops after too many redirects", async () => {
+    serve({ "https://blog.example.com/loop": { body: "", status: 302, location: "https://blog.example.com/loop" } });
+    await expect(loadRssFeed({ url: "https://blog.example.com/loop", limit: 5, resolve })).rejects.toThrow(/redirected more than 5 times/);
+  });
+
+  it("stops reading a feed that is too big", async () => {
+    mockFetch(rssXml.replace("Newer summary", "x".repeat(5000)));
+    await expect(loadRssFeed({ url: "https://example.com/feed.xml", limit: 5, maxBytes: 2000 })).rejects.toThrow(/bigger than 1 MB|bigger than/);
+    mockFetch(rssXml);
+    await expect(loadRssFeed({ url: "https://example.com/feed.xml", limit: 5, maxBytes: 2000 })).resolves.toHaveLength(2);
+  });
+
+  it("does not expand entities a feed declares in its DOCTYPE", async () => {
+    const laughs = Array.from({ length: 9 }, (_, i) => `<!ENTITY lol${i + 1} "${`&lol${i};`.repeat(10)}">`).join("");
+    mockFetch(`<?xml version="1.0"?>
+<!DOCTYPE rss [<!ENTITY secret "EXPANDED"><!ENTITY lol0 "lol">${laughs}]>
+<rss version="2.0"><channel><title>T</title>
+  <item><title>Post</title><link>https://example.com/post?ref=&secret;</link><guid>&lol9;</guid><pubDate>Sat, 31 May 2026 10:00:00 GMT</pubDate></item>
+</channel></rss>`);
+    const [item] = await loadRssFeed({ url: "https://example.com/feed.xml", limit: 5 });
+    expect(item.title).toBe("Post");
+    expect(item.url).not.toContain("EXPANDED");
+  });
+
+  it("knows which addresses are private or local", () => {
+    for (const address of ["127.0.0.1", "10.1.2.3", "172.16.0.1", "172.31.255.255", "192.168.0.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "::1", "::", "fd00::1", "fe80::1", "::ffff:127.0.0.1", "::ffff:7f00:1", "64:ff9b::a00:1"]) {
+      expect(isPrivateAddress(address), address).toBe(true);
+    }
+    for (const address of ["93.184.215.14", "8.8.8.8", "172.32.0.1", "100.128.0.1", "2606:4700::1111", "::ffff:8.8.8.8"]) {
+      expect(isPrivateAddress(address), address).toBe(false);
+    }
   });
 });

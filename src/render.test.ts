@@ -59,6 +59,31 @@ describe("renderers", () => {
     expect(text).toContain("Sent by Example.");
   });
 
+  it("links only http(s) addresses, so front matter or a draft cannot add a javascript: link", () => {
+    const html = renderHtml({
+      ...issue,
+      unsubscribeUrl: "javascript:alert(document.domain)",
+      items: [
+        { title: "Script link", url: "javascript:fetch('/api/send')", image: "https://example.com/a.png" },
+        { title: "Data link", url: "data:text/html,<script>alert(1)</script>" },
+        { title: "Spaced", url: " JavaScript:alert(1)" },
+        { title: "Fine", url: "https://example.com/fine" },
+      ],
+    });
+    expect(html).not.toMatch(/javascript:/i);
+    expect(html).not.toMatch(/href="data:/i);
+    expect(html).toContain('href="https://example.com/fine"');
+    expect(html).toContain("Script link");
+    expect(html).not.toContain(">Unsubscribe<");
+    const text = renderText({ ...issue, items: [{ title: "Script link", url: "javascript:alert(1)" }] });
+    expect(text).not.toMatch(/javascript:/i);
+  });
+
+  it("keeps the SMTPfast unsubscribe placeholder and mailto: unsubscribe links", () => {
+    expect(renderHtml({ ...issue, unsubscribeUrl: "{{unsubscribe_url}}" })).toContain('href="{{unsubscribe_url}}"');
+    expect(renderHtml({ ...issue, unsubscribeUrl: "mailto:leave@example.com" })).toContain('href="mailto:leave@example.com"');
+  });
+
   it("escapes html in item fields", () => {
     const xss = {
       ...issue,

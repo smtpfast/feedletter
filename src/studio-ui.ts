@@ -175,7 +175,7 @@ export function renderStudioPage(config: StudioPageConfig): string {
             <span class="inbox-text"><strong id="inboxSubject"></strong><span id="inboxPreheader" class="inbox-pre"></span></span>
           </div>
           <div id="previewBody" class="preview-body">
-            <iframe id="previewFrame" title="Email preview" hidden></iframe>
+            <iframe id="previewFrame" title="Email preview" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox" hidden></iframe>
             <pre id="previewText" hidden></pre>
             <div id="previewEmpty" class="empty preview-empty">Your rendered email shows up here.</div>
           </div>
@@ -497,6 +497,23 @@ function setStatus(msg, kind){
 }
 $("statusPill").addEventListener("click", ()=>{ $("statusPill").hidden = true; });
 
+// This launch's token comes in the link the studio printed (#token=...). It is
+// kept for this tab only and taken out of the address bar; the served HTML never contains it.
+const studioToken = (function(){
+  let token = "";
+  try{ token = new URLSearchParams(location.hash.slice(1)).get("token") || ""; }catch(e){}
+  if(token){
+    try{ sessionStorage.setItem("feedletter.token", token); }catch(e){}
+    try{ window.history.replaceState(null, "", location.pathname + location.search); }catch(e){}
+    return token;
+  }
+  try{ return sessionStorage.getItem("feedletter.token") || ""; }catch(e){ return ""; }
+})();
+function api(path, body){
+  return fetch(path,{method:"POST",headers:{"content-type":"application/json","x-feedletter-token":studioToken},body:JSON.stringify(body)});
+}
+if(!studioToken) setStatus("Open the link that feedletter studio printed in your terminal: it has the token this page needs.","err");
+
 // ---- source toggle ----
 $("segRss").onclick = () => switchSource("rss");
 $("segContent").onclick = () => switchSource("content");
@@ -549,7 +566,7 @@ async function load(){
       : state.sourceType==="dailydev"
         ? { type:"dailydev", feed:dailyDevSpec(), link:$("ddLink").value, limit:$("limit").value }
         : { type:"content", content:$("contentDir").value, baseUrl:$("baseUrl").value, limit:$("limit").value };
-    const res = await fetch("/api/load",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    const res = await api("/api/load", body);
     const data = await res.json();
     if(!res.ok){ throw new Error(data.error||"Load failed"); }
     if(!data.items || data.items.length===0){
@@ -724,7 +741,7 @@ async function refreshPreview(){
     return showPreviewEmpty("Tick at least one item to build the email.");
   }
   try{
-    const res = await fetch("/api/render",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(draft())});
+    const res = await api("/api/render", draft());
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"Render failed");
     state.lastHtml = data.html; state.lastText = data.text;
@@ -770,7 +787,7 @@ async function improve(){
   const btn = $("improveBtn"); btn.disabled=true; const label=btn.textContent; btn.innerHTML='<span class="spin"></span> Improving…';
   const errEl = $("improveError"); errEl.hidden = true;
   try{
-    const res = await fetch("/api/enrich",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({...draft(), tone:"clear, useful, developer-friendly"})});
+    const res = await api("/api/enrich", {...draft(), tone:"clear, useful, developer-friendly"});
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"AI failed");
     if(data.title) $("subject").value = data.title;
@@ -830,7 +847,7 @@ async function verifyFrom(){
   if(!key || from.indexOf("@") < 1){ el.hidden = true; return; }
   el.hidden = false; el.className = "from-status checking"; el.textContent = "Checking domain…";
   try{
-    const res = await fetch("/api/verify-domain",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({apiKey:key,from})});
+    const res = await api("/api/verify-domain", {apiKey:key,from});
     const d = await res.json();
     if(!res.ok) throw new Error(d.error||"check failed");
     if(d.verified){ el.className = "from-status ok"; el.textContent = "✓ Domain verified for sending"; }
@@ -925,7 +942,7 @@ async function loadAudience(){
   refreshSendButtons();
   info.className = "audience-info"; info.textContent = "Checking your contacts…";
   try{
-    const res = await fetch("/api/audience",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({apiKey:key, segmentId:$("audienceSelect").value})});
+    const res = await api("/api/audience", {apiKey:key, segmentId:$("audienceSelect").value});
     const d = await res.json();
     if(!res.ok) throw new Error(d.error||"Could not check your contacts.");
     if(!audienceState.settle(token, d)) return;
@@ -961,9 +978,9 @@ async function doBroadcast(sendNow){
   btn.innerHTML = '<span class="spin"></span> ' + (sendNow ? "Sending…" : "Saving…");
   try{
     rememberKey();
-    const res = await fetch("/api/broadcast",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({
+    const res = await api("/api/broadcast", {
       apiKey:$("apiKey").value, from:fromHeader(), segmentId:$("audienceSelect").value, send:sendNow, draft:draft(),
-    })});
+    });
     const d = await res.json();
     if(!res.ok){ const err = new Error(d.error||"Broadcast failed"); err.url = d.url; throw err; }
     const link = ' <a href="'+escapeHtml(d.url)+'" target="_blank" rel="noopener">Open it in SMTPfast</a>.';
@@ -1036,7 +1053,7 @@ async function doSend(isTest){
     rememberKey();
     const recipients = isTest ? $("testTo").value : $("recipients").value;
     const body = { apiKey:$("apiKey").value, from:fromHeader(), recipients, test:isTest, draft:draft() };
-    const res = await fetch("/api/send",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(body)});
+    const res = await api("/api/send", body);
     const data = await res.json();
     if(!res.ok) throw new Error(data.error||"Send failed");
     const failed = (data.results||[]).filter((r)=>!r.ok && !r.suppressed && !r.alreadySent && !r.uncertain);

@@ -1,3 +1,4 @@
+import { UNSUBSCRIBE_PLACEHOLDER } from "./smtpfast.js";
 import type { DigestIssue, SourceItem } from "./types.js";
 
 function escapeHtml(value: string) {
@@ -7,6 +8,19 @@ function escapeHtml(value: string) {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#039;");
+}
+
+/** Only http(s) links reach the email: a javascript: or data: link from front matter or a draft is dropped. */
+export function safeLink(url: string | undefined): string | undefined {
+  const value = url?.trim();
+  return value && /^https?:\/\/[^\s]+$/i.test(value) ? value : undefined;
+}
+
+/** The unsubscribe link may also be SMTPfast's per-recipient placeholder or a mailto: address. */
+function safeUnsubscribeLink(url: string | undefined): string | undefined {
+  const value = url?.trim();
+  if (value === UNSUBSCRIBE_PLACEHOLDER || (value && /^mailto:[^\s]+$/i.test(value))) return value;
+  return safeLink(value);
 }
 
 function formatDate(value?: string) {
@@ -28,10 +42,10 @@ function formatDate(value?: string) {
 // Padding after the preheader so inbox previews do not run on into the body text.
 const PREHEADER_PADDING = "&#847;&zwnj;&nbsp;".repeat(60);
 
-function readingHost(item: SourceItem) {
-  if (!item.url) return "";
+function readingHost(url: string | undefined) {
+  if (!url) return "";
   try {
-    return new URL(item.url).hostname.replace(/^www\./, "");
+    return new URL(url).hostname.replace(/^www\./, "");
   } catch {
     return "";
   }
@@ -41,16 +55,17 @@ function renderItem(item: SourceItem) {
   const title = escapeHtml(item.title);
   const summary = item.summary ? escapeHtml(item.summary) : "";
   const date = formatDate(item.date);
-  const host = readingHost(item);
+  const url = safeLink(item.url);
+  const host = readingHost(url);
   const meta = [date, item.author, host].filter(Boolean).join(" · ");
-  const titleHtml = item.url
-    ? `<a href="${escapeHtml(item.url)}" style="color:#111827;text-decoration:none;">${title}</a>`
+  const titleHtml = url
+    ? `<a href="${escapeHtml(url)}" style="color:#111827;text-decoration:none;">${title}</a>`
     : title;
   const image = item.image && /^https?:\/\//i.test(item.image) ? escapeHtml(item.image) : "";
   const imageHtml = image
     ? `<img src="${image}" alt="" width="678" border="0" style="display:block;width:100%;max-width:100%;height:auto;border:0;outline:none;text-decoration:none;border-radius:16px 16px 0 0;" />`
     : "";
-  const linkedImage = imageHtml && item.url ? `<a href="${escapeHtml(item.url)}" style="text-decoration:none;">${imageHtml}</a>` : imageHtml;
+  const linkedImage = imageHtml && url ? `<a href="${escapeHtml(url)}" style="text-decoration:none;">${imageHtml}</a>` : imageHtml;
 
   return `
     <tr>
@@ -63,8 +78,8 @@ function renderItem(item: SourceItem) {
               <h2 style="margin:0 0 9px;font-size:20px;line-height:28px;color:#111827;font-weight:800;overflow-wrap:break-word;word-wrap:break-word;">${titleHtml}</h2>
               ${summary ? `<p style="margin:0 0 16px;font-size:15px;line-height:24px;color:#475569;">${summary}</p>` : ""}
               ${
-                item.url
-                  ? `<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td bgcolor="#059669" style="border-radius:999px;background:#059669;mso-padding-alt:9px 14px;"><a href="${escapeHtml(item.url)}" style="display:inline-block;padding:9px 14px;font-size:13px;line-height:18px;color:#ffffff;font-weight:700;text-decoration:none;">Read the post</a></td></tr></table>`
+                url
+                  ? `<table role="presentation" cellspacing="0" cellpadding="0" border="0"><tr><td bgcolor="#059669" style="border-radius:999px;background:#059669;mso-padding-alt:9px 14px;"><a href="${escapeHtml(url)}" style="display:inline-block;padding:9px 14px;font-size:13px;line-height:18px;color:#ffffff;font-weight:700;text-decoration:none;">Read the post</a></td></tr></table>`
                   : ""
               }
             </td>
@@ -86,9 +101,10 @@ export function renderHtml(issue: DigestIssue) {
   if (issue.footerNote) {
     footerBits.push(`<p style="margin:0 0 6px;font-size:12px;line-height:19px;color:#64748b;">${escapeHtml(issue.footerNote)}</p>`);
   }
-  if (issue.unsubscribeUrl) {
+  const unsubscribeUrl = safeUnsubscribeLink(issue.unsubscribeUrl);
+  if (unsubscribeUrl) {
     footerBits.push(
-      `<p style="margin:0;font-size:12px;line-height:19px;color:#64748b;"><a href="${escapeHtml(issue.unsubscribeUrl)}" style="color:#059669;text-decoration:underline;">Unsubscribe</a></p>`,
+      `<p style="margin:0;font-size:12px;line-height:19px;color:#64748b;"><a href="${escapeHtml(unsubscribeUrl)}" style="color:#059669;text-decoration:underline;">Unsubscribe</a></p>`,
     );
   } else {
     footerBits.push(
@@ -170,6 +186,7 @@ export function renderHtml(issue: DigestIssue) {
 }
 
 export function renderText(issue: DigestIssue) {
+  const unsubscribeUrl = safeUnsubscribeLink(issue.unsubscribeUrl);
   const lines = [
     issue.title,
     "",
@@ -178,12 +195,12 @@ export function renderText(issue: DigestIssue) {
     ...issue.items.flatMap((item, index) => [
       `${index + 1}. ${item.title}`,
       item.summary ?? "",
-      item.url ?? "",
+      safeLink(item.url) ?? "",
       "",
     ]),
     ...(issue.footerNote ? [issue.footerNote] : []),
-    issue.unsubscribeUrl
-      ? `Unsubscribe: ${issue.unsubscribeUrl}`
+    unsubscribeUrl
+      ? `Unsubscribe: ${unsubscribeUrl}`
       : `Generated by Feedletter on ${formatDate(issue.generatedAt)}.`,
     "",
   ];

@@ -28,12 +28,21 @@ export interface SendResult {
   alreadySent?: boolean;
   /** SMTPfast may or may not have sent to this address (a 5xx or no answer, now or in an earlier run). */
   uncertain?: boolean;
+  /** Uncertain from an earlier run whose batch is too old to check with its Idempotency-Key (see MAX_REPLAY_AGE_MS). */
+  replayExpired?: boolean;
 }
 
 /** SMTPfast accepts up to 100 emails per POST /v1/emails/batch call. */
 export const BATCH_SIZE = 100;
 /** SMTPfast stores broadcast HTML up to this many characters. */
 export const BROADCAST_HTML_LIMIT = 100_000;
+/**
+ * SMTPfast answers a repeated Idempotency-Key with its first answer for 24
+ * hours. An uncertain batch is replayed only while its key is younger than
+ * this, an hour inside that window for clock differences; an older one stays
+ * uncertain and is reported, never sent again on its own.
+ */
+export const MAX_REPLAY_AGE_MS = 23 * 60 * 60 * 1000;
 const REQUEST_TIMEOUT_MS = 30000;
 const MAX_RATE_LIMIT_RETRIES = 3;
 const MAX_RETRY_WAIT_MS = 60000;
@@ -50,15 +59,16 @@ export class SmtpfastError extends Error {
   }
 }
 
-/** A 4xx from SMTPfast: the request was refused before anything was queued. */
+/** A 4xx, or a redirect, from SMTPfast: the request was refused before anything was queued. */
 function refusedBeforeQueueing(error: unknown) {
   // A 409 on a request with an Idempotency-Key is not a refusal: the key may
   // belong to a batch that went out (an expired key, or a request still
-  // running), so its outcome is unknown.
+  // running), so its outcome is unknown. A redirect is never followed, and
+  // the API never answers a send with one, so nothing was queued.
   return (
     error instanceof SmtpfastError &&
     error.status !== undefined &&
-    error.status >= 400 &&
+    error.status >= 300 &&
     error.status < 500 &&
     error.status !== 409
   );
@@ -113,6 +123,8 @@ async function smtpfastRequest<T>(
         // Bun's fetch replays a request once when a pooled connection drops
         // after it was sent, which would send a batch twice. No reuse for POSTs.
         keepalive: method === "GET",
+        // A redirect would take the API key and the email to another address.
+        redirect: "manual",
         signal: controller.signal,
       });
       text = await response.text();
@@ -124,6 +136,14 @@ async function smtpfastRequest<T>(
       throw new SmtpfastError(`Could not reach SMTPfast: ${reason.replace(/\.?\s*$/, ".")}`, undefined, true);
     } finally {
       clearTimeout(timer);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      throw new SmtpfastError(
+        `SMTPfast answered with a redirect (${response.status}${location ? ` to ${location.slice(0, 200)}` : ""}). Feedletter does not follow redirects, so the API key stays with the address you gave. Check the API URL.`,
+        response.status,
+      );
     }
 
     let rateLimitNote = "";
@@ -235,8 +255,11 @@ export interface SendCheckpoint {
   record(rows: Array<{ recipient: string; id?: string }>, state: "sent" | "uncertain", batchKey?: string): Promise<void> | void;
   /** Drop addresses written ahead for a batch SMTPfast refused with a 4xx (nothing was queued). */
   forget(recipients: string[]): Promise<void> | void;
-  /** Uncertain batches from earlier runs, in their original order, with the key each went out with. */
-  uncertainBatches?(): Array<{ key: string; recipients: string[] }>;
+  /**
+   * Uncertain batches from earlier runs, in their original order, with the key
+   * each went out with and when that attempt started (an ISO date).
+   */
+  uncertainBatches?(): Array<{ key: string; recipients: string[]; startedAt: string }>;
 }
 
 const DEFAULT_RETRY_DELAYS_MS = [2_000, 8_000];
@@ -315,10 +338,17 @@ export async function sendDigest(
   // with: SMTPfast answers with the first answer if the batch went out, and
   // sends it now if it never did. Only a batch whose addresses are all in this
   // run's list can be replayed; SMTPfast refuses a changed body with a 409.
+  // A batch older than the key window cannot be checked, so it is not replayed.
   const replayed = new Map<string, SendResult>();
+  const tooOld = new Set<string>();
   const original = new Map(valid.map((recipient) => [recipient.toLowerCase(), recipient]));
   const scope = accountScope(config);
   for (const batch of checkpoint?.uncertainBatches?.() ?? []) {
+    const age = Date.now() - Date.parse(batch.startedAt);
+    if (!(age < MAX_REPLAY_AGE_MS)) {
+      for (const recipient of batch.recipients) tooOld.add(recipient);
+      continue;
+    }
     const chunk = batch.recipients.map((recipient) => original.get(recipient));
     if (chunk.some((recipient) => recipient === undefined)) continue;
     const [batchScope, idempotencyKey] = batch.key.split(":", 2);
@@ -344,6 +374,14 @@ export async function sendDigest(
     const previous = checkpoint?.previous.get(lower);
     if (previous === "sent") {
       results.push({ recipient, ok: false, alreadySent: true, error: "already sent in an earlier run" });
+    } else if (previous === "uncertain" && tooOld.has(lower)) {
+      results.push({
+        recipient,
+        ok: false,
+        uncertain: true,
+        replayExpired: true,
+        error: "an earlier run could not tell whether this was sent, over 23 hours ago, too long ago to check with SMTPfast; skipped",
+      });
     } else if (previous === "uncertain") {
       results.push({ recipient, ok: false, uncertain: true, error: "an earlier run could not tell whether this was sent; skipped" });
     } else {

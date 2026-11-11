@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync } from "node:fs";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { HistoryStore, itemHistoryKey } from "./history.js";
@@ -120,7 +120,7 @@ describe("HistoryStore send lock", () => {
       await store.recordRecipients("key", batch.map((recipient) => ({ recipient })), "uncertain");
       await store.forgetRecipients("key", batch);
     });
-    expect([...store.sentRecipients("key")].sort()).toEqual([
+    expect([...store.sentRecipients("key", ["sent@example.com", "maybe@example.com", "new@example.com"])].sort()).toEqual([
       ["maybe@example.com", "uncertain"],
       ["sent@example.com", "sent"],
     ]);
@@ -138,7 +138,7 @@ describe("HistoryStore send lock", () => {
     b.close();
 
     const reopened = await HistoryStore.open(dbPath);
-    expect([...reopened.sentRecipients("key")].sort()).toEqual([
+    expect([...reopened.sentRecipients("key", ["one@example.com", "two@example.com"])].sort()).toEqual([
       ["one@example.com", "sent"],
       ["two@example.com", "uncertain"],
     ]);
@@ -158,11 +158,104 @@ describe("HistoryStore batch keys", () => {
     old.close();
 
     const store = await HistoryStore.open(dbPath);
-    expect(store.sentRecipients("key").get("old@example.com")).toBe("uncertain");
-    expect(store.uncertainBatches("key")).toEqual([]);
+    const list = ["old@example.com", "New@example.com", "two@example.com"];
+    expect(store.sentRecipients("key", list).get("old@example.com")).toBe("uncertain");
+    expect(store.uncertainBatches("key", list)).toEqual([]);
     await store.exclusive(() => store.recordRecipients("key", [{ recipient: "New@example.com" }, { recipient: "two@example.com" }], "uncertain", "feedletter-abc"));
-    expect(store.uncertainBatches("key")).toEqual([{ key: "feedletter-abc", recipients: ["new@example.com", "two@example.com"] }]);
+    expect(store.uncertainBatches("key", list)).toEqual([{ key: "feedletter-abc", recipients: ["new@example.com", "two@example.com"], startedAt: expect.any(String) }]);
     store.close();
   });
 });
 
+
+describe("HistoryStore recipient hashes", () => {
+  const KEY = "dummy-history-key-0123456789abcdef";
+  const list = ["Reader0@example.test", "reader1@example.test", "reader2@example.test"];
+
+  async function rawRecipients(dbPath: string) {
+    const initSqlJs = (await import("sql.js")).default;
+    const SQL = await initSqlJs();
+    const db = new SQL.Database(await readFile(dbPath));
+    const rows = db.exec("SELECT recipient FROM sent_recipients ORDER BY rowid")[0]?.values.map((row) => String(row[0])) ?? [];
+    db.close();
+    return rows;
+  }
+
+  it("stores keyed hashes, never addresses, and still matches this run's list", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath, { recipientKey: KEY });
+    await store.exclusive(async () => {
+      await store.recordRecipients("key", [{ recipient: list[0], id: "e0" }]);
+      await store.recordRecipients("key", [{ recipient: list[1] }], "uncertain", "scope:k1");
+    });
+    store.close();
+
+    const raw = await rawRecipients(dbPath);
+    expect(raw).toHaveLength(2);
+    expect(raw.filter((value) => value.includes("@"))).toEqual([]);
+    expect(raw.every((value) => /^hmac:[0-9a-f]{64}$/.test(value))).toBe(true);
+
+    const reopened = await HistoryStore.open(dbPath, { recipientKey: KEY });
+    expect([...reopened.sentRecipients("key", list)].sort()).toEqual([
+      ["reader0@example.test", "sent"],
+      ["reader1@example.test", "uncertain"],
+    ]);
+    expect(reopened.uncertainBatches("key", list)).toEqual([{ key: "scope:k1", recipients: ["reader1@example.test"], startedAt: expect.any(String) }]);
+    // An address that left the list cannot be matched, so its batch is never replayed for someone else.
+    expect(reopened.uncertainBatches("key", [list[0]])[0].recipients[0]).toMatch(/^hmac:/);
+    reopened.close();
+  });
+
+  it("turns plain addresses from an older file into hashes on the next locked write", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const plain = await HistoryStore.open(dbPath);
+    await plain.exclusive(async () => {
+      await plain.recordRecipients("key", [{ recipient: list[0], id: "e0" }]);
+      await plain.recordRecipients("key", [{ recipient: list[1] }, { recipient: list[2] }], "uncertain", "scope:k1");
+    });
+    plain.close();
+    expect((await rawRecipients(dbPath)).filter((value) => value.includes("@"))).toHaveLength(3);
+
+    const store = await HistoryStore.open(dbPath, { recipientKey: KEY });
+    // Reading works before anything is written.
+    expect(store.sentRecipients("key", list).get("reader0@example.test")).toBe("sent");
+    await store.exclusive(async () => undefined);
+    store.close();
+
+    expect((await rawRecipients(dbPath)).filter((value) => value.includes("@"))).toEqual([]);
+    const reopened = await HistoryStore.open(dbPath, { recipientKey: KEY });
+    expect([...reopened.sentRecipients("key", list)].sort()).toEqual([
+      ["reader0@example.test", "sent"],
+      ["reader1@example.test", "uncertain"],
+      ["reader2@example.test", "uncertain"],
+    ]);
+    // The batch keeps its order and its key.
+    expect(reopened.uncertainBatches("key", list)).toEqual([
+      { key: "scope:k1", recipients: ["reader1@example.test", "reader2@example.test"], startedAt: expect.any(String) },
+    ]);
+    reopened.close();
+  });
+
+  it("refuses to read or write recipients without the key, or with another one", async () => {
+    const dbPath = path.join(dir, "history.sqlite");
+    const store = await HistoryStore.open(dbPath, { recipientKey: KEY });
+    await store.exclusive(() => store.recordRecipients("key", [{ recipient: list[0] }]));
+    store.close();
+
+    const noKey = await HistoryStore.open(dbPath);
+    expect(() => noKey.sentRecipients("key", list)).toThrow(/stores recipients as keyed hashes\. Set FEEDLETTER_HISTORY_KEY/);
+    expect(() => noKey.uncertainBatches("key", list)).toThrow(/keyed hashes/);
+    await expect(noKey.exclusive(() => noKey.recordRecipients("key", [{ recipient: list[1] }]))).rejects.toThrow(/keyed hashes/);
+    // Item history needs no key.
+    await noKey.exclusive(() => noKey.recordIssue(issueOf(items)));
+    noKey.close();
+
+    const otherKey = await HistoryStore.open(dbPath, { recipientKey: "another-dummy-key-0123456789" });
+    expect(() => otherKey.sentRecipients("key", list)).toThrow(/not the key this history file was written with/);
+    otherKey.close();
+  });
+
+  it("rejects a short key", async () => {
+    await expect(HistoryStore.open(path.join(dir, "history.sqlite"), { recipientKey: "short" })).rejects.toThrow(/at least 16 characters/);
+  });
+});

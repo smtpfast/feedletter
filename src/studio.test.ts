@@ -1,19 +1,23 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { HistoryStore } from "./history.js";
 import { createServer, request, type IncomingMessage, type Server } from "node:http";
-import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { AddressInfo } from "node:net";
-import { bindNeedsHostGuard, isLoopbackHost, rejectForeignRequest, startStudioServer } from "./studio.js";
+import { bindNeedsHostGuard, isLoopbackHost, rejectForeignRequest, startStudioServer, studioUrl } from "./studio.js";
 import { SEND_GUARD_SOURCE } from "./studio-ui.js";
 
-let studio: Server;
+type Studio = Awaited<ReturnType<typeof startStudioServer>>;
+/** What the studio page sends: JSON, and this launch's token. */
+const apiHeaders = (server: Studio) => ({ "content-type": "application/json", "x-feedletter-token": server.sessionToken });
+
+let studio: Studio;
 let mock: Server;
 let base: string;
 let mockUrl: string;
 let contentDir: string;
-let dailyDevStudio: Server | undefined;
+let dailyDevStudio: Studio | undefined;
 
 // A stand-in for the SMTPfast API so the studio's own fetch has something to hit
 // without stubbing global fetch (which the test itself uses to call the studio).
@@ -100,7 +104,7 @@ function startMock(): Promise<Server> {
 async function post(pathname: string, body: unknown) {
   const res = await fetch(`${base}${pathname}`, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: apiHeaders(studio),
     body: JSON.stringify(body),
   });
   return { status: res.status, data: (await res.json()) as Record<string, unknown> };
@@ -139,6 +143,74 @@ describe("studio server", () => {
     expect(html).toContain("Feedletter Studio");
     expect(html).toContain('role="dialog"');
     expect(html).toContain('id="viewMobile"');
+  });
+
+  it("refuses every API call without this launch's token", async () => {
+    const routes = ["/api/load", "/api/render", "/api/enrich", "/api/verify-domain", "/api/send", "/api/audience", "/api/broadcast"];
+    for (const route of routes) {
+      for (const token of [undefined, "", "wrong-token", `${studio.sessionToken}x`]) {
+        const headers: Record<string, string> = { "content-type": "application/json" };
+        if (token !== undefined) headers["x-feedletter-token"] = token;
+        // A local client with no Origin header, like the one in the audit.
+        const res = await fetch(`${base}${route}`, { method: "POST", headers, body: JSON.stringify({ type: "content", content: contentDir }) });
+        expect(res.status, `${route} with token ${JSON.stringify(token)}`).toBe(401);
+        expect(String(((await res.json()) as { error: string }).error)).toMatch(/Open the link that feedletter studio printed/);
+      }
+    }
+    const ok = await post("/api/load", { type: "content", content: contentDir, limit: 10 });
+    expect(ok.status).toBe(200);
+  });
+
+  it("never puts the token in the page, and makes a new one for every launch", async () => {
+    const res = await fetch(`${base}/`);
+    const html = await res.text();
+    expect(studio.sessionToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
+    expect(html).not.toContain(studio.sessionToken);
+    const another = await startStudioServer({ host: "127.0.0.1", port: 0, history: false });
+    try {
+      expect(another.sessionToken).not.toBe(studio.sessionToken);
+      const port = (another.address() as AddressInfo).port;
+      const res = await fetch(`http://127.0.0.1:${port}/api/render`, { method: "POST", headers: apiHeaders(studio), body: "{}" });
+      expect(res.status).toBe(401);
+    } finally {
+      await new Promise<void>((r) => another.close(() => r()));
+    }
+    expect(studioUrl("127.0.0.1", 4180, "abc")).toBe("http://127.0.0.1:4180/#token=abc");
+    expect(studioUrl("::1", 4180, "abc")).toBe("http://[::1]:4180/#token=abc");
+  });
+
+  it("cannot be framed by another site and sandboxes the email preview", async () => {
+    const res = await fetch(`${base}/`);
+    expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    const html = await res.text();
+    const frame = /<iframe id="previewFrame"[^>]*>/.exec(html)?.[0] ?? "";
+    expect(frame).toMatch(/sandbox="[^"]*"/);
+    expect(frame).not.toMatch(/allow-scripts/);
+  });
+
+  it("does not start with a history key that is too short", async () => {
+    await expect(startStudioServer({ host: "127.0.0.1", port: 0, historyDb: path.join(contentDir, "short.sqlite"), historyKey: "short" })).rejects.toThrow(
+      /at least 16 characters/,
+    );
+  });
+
+  it("stores list-send recipients as keyed hashes when a history key is set", async () => {
+    const historyDb = path.join(contentDir, "hashed.sqlite");
+    const hashed = await startStudioServer({ host: "127.0.0.1", port: 0, retryDelaysMs: [0, 0], historyDb, historyKey: "dummy-history-key-0123456789abcdef" });
+    const url = `http://127.0.0.1:${(hashed.address() as AddressInfo).port}/api/send`;
+    const body = JSON.stringify({ apiKey: "k", from: "news@example.com", recipients: "h1@x.com, h2@x.com", draft: { ...draft, title: "Hashed" }, baseUrl: mockUrl });
+    try {
+      const first = (await (await fetch(url, { method: "POST", headers: apiHeaders(hashed), body })).json()) as Record<string, unknown>;
+      expect(first).toMatchObject({ sent: 2 });
+      received.length = 0;
+      const second = (await (await fetch(url, { method: "POST", headers: apiHeaders(hashed), body })).json()) as Record<string, unknown>;
+      expect(second).toMatchObject({ sent: 0, alreadySent: 2 });
+      expect(received.some((r) => r.url === "/v1/emails/batch")).toBe(false);
+      expect((await readFile(historyDb)).includes(Buffer.from("@x.com"))).toBe(false);
+    } finally {
+      await new Promise<void>((r) => hashed.close(() => r()));
+    }
   });
 
   it("rejects a cross-origin POST", async () => {
@@ -196,7 +268,7 @@ describe("studio server", () => {
 
     const res = await fetch(`${ddBase}/api/load`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: apiHeaders(dailyDevStudio),
       body: JSON.stringify({ type: "dailydev", feed: "popular:kubernetes", link: "discussion", limit: 5 }),
     });
     const data = (await res.json()) as { items: Array<{ title: string; url: string }>; sourceLabel: string };
@@ -206,7 +278,7 @@ describe("studio server", () => {
 
     const bad = await fetch(`${ddBase}/api/load`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers: apiHeaders(dailyDevStudio),
       body: JSON.stringify({ type: "dailydev", feed: "trending", limit: 5 }),
     });
     expect(bad.status).toBe(400);
@@ -364,7 +436,7 @@ describe("studio server", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${(second.address() as AddressInfo).port}/api/send`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: apiHeaders(second),
         body: JSON.stringify({ apiKey: "k", from: "news@example.com", recipients: "l@x.com", draft: { ...draft, title: "Locked" }, baseUrl: mockUrl }),
       });
       expect(res.status).toBe(409);
@@ -397,7 +469,7 @@ describe("studio server", () => {
     const call = (extra: Record<string, unknown>) =>
       fetch(url, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: apiHeaders(studioWithHistory),
         body: JSON.stringify({ apiKey: "k", from: "news@example.com", draft: { ...draft, title: "Shared" }, baseUrl: mockUrl, ...extra }),
       });
     try {
@@ -429,7 +501,7 @@ describe("studio server", () => {
     try {
       const res = await fetch(`http://127.0.0.1:${(studioWithHistory.address() as AddressInfo).port}/api/send`, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: apiHeaders(studioWithHistory),
         body: JSON.stringify({ apiKey: "k", from: "news@example.com", recipients: "s@x.com", draft: { ...draft, title: "Stale" }, baseUrl: mockUrl }),
       });
       expect(res.status).toBe(409);

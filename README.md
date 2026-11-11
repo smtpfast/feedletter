@@ -143,6 +143,7 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--ai-model <model>` | `AI_MODEL` | AI model name. |
 | `--agent-command <command>` | — | External writer command that receives the editorial prompt on stdin and prints JSON. Cannot be used with `--ai`. |
 | `--agent-timeout <ms>` | `120000` | Timeout for the external writer command. |
+| `--agent-env <names>` | — | More environment variables to pass to the writer, by name (for example `ANTHROPIC_API_KEY`). See [AI and agent writers](#ai-and-agent-writers). |
 | `--tone <tone>` | `clear, useful, developer-friendly` | Writing tone used by AI or the external writer. |
 
 ### `feedletter preview`
@@ -166,6 +167,7 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--no-history` | history enabled | Do not track or flag previously sent items. |
 | `--agent-command <command>` | — | Use an external writer, such as `claude -p` or `codex`, for Improve instead of the AI API. |
 | `--agent-timeout <ms>` | `120000` | Timeout for the external writer command. |
+| `--agent-env <names>` | — | More environment variables to pass to the writer, by name. |
 
 ### `feedletter send`
 
@@ -176,7 +178,8 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--to <list>` | — | Recipients separated by commas, spaces, or newlines. |
 | `--to-file <path>` | — | File containing one recipient per line; lines beginning with `#` are ignored. |
 | `--footer <text>` | issue footer | Footer note displayed above the unsubscribe link. |
-| `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
+| `--api-key-file <path>` | `SMTPFAST_API_KEY` | File that holds the SMTPfast API key. |
+| `--api-key <key>` | — | Deprecated: other users on the machine can read a command-line value in the process list. Use `SMTPFAST_API_KEY` or `--api-key-file`. Still works, with a warning. |
 | `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
 | `--test` | off | Send only to the first recipient and do not record history. |
 | `--resend` | off | Send to every recipient, even ones an earlier run of this exact issue reached or may have reached. |
@@ -194,7 +197,8 @@ Every command also supports `--help`. The top-level command supports `--version`
 | `--footer <text>` | issue footer | Footer note displayed above the unsubscribe link. |
 | `--send` | off | Send now. Without it, Feedletter creates a draft to review and send in SMTPfast. |
 | `--resend` | off | Create a new broadcast even if this exact issue was already broadcast. |
-| `--api-key <key>` | `SMTPFAST_API_KEY` | SMTPfast API key. |
+| `--api-key-file <path>` | `SMTPFAST_API_KEY` | File that holds the SMTPfast API key. |
+| `--api-key <key>` | — | Deprecated: other users on the machine can read a command-line value in the process list. Use `SMTPFAST_API_KEY` or `--api-key-file`. Still works, with a warning. |
 | `--api-url <url>` | `SMTPFAST_API_URL`, or SMTPfast default | SMTPfast API base URL. |
 | `--history-db <path>` | `.feedletter/feedletter.sqlite` | SQLite file used to record sent items and the broadcast id. |
 | `--no-history` | history enabled | Do not record sent items or the broadcast id. |
@@ -202,12 +206,19 @@ Every command also supports `--help`. The top-level command supports `--version`
 ## Studio
 
 The studio is the fastest way to go from a feed to a sent issue. Start it and
-open the printed URL:
+open the printed link:
 
 ```bash
 feedletter studio
+# Feedletter Studio running at http://127.0.0.1:4180/#token=...
 # or preload a source: feedletter studio --content ./content/blog --base-url https://example.com
 ```
+
+The link carries a token that is new every time the studio starts. The page
+keeps it for that browser tab and sends it with every request, and the studio
+answers no request without it. A bookmark of `http://127.0.0.1:4180/` without
+the token opens the page, but it cannot load or send anything: open the link
+the studio printed.
 
 To use daily.dev in the studio, start it with `DAILY_DEV_TOKEN` set. The token
 stays on the local server; the page never sees it. You can also open
@@ -248,14 +259,18 @@ In the studio you can:
 - sending the same email again skips the people it already reached, and the
   same broadcast is never created or sent twice
 
-You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml`
-or `?dir=./content/blog&base=https://example.com`.
+You can deep-link a source: `http://127.0.0.1:4180/?feed=https://example.com/rss.xml#token=...`
+or `?dir=./content/blog&base=https://example.com#token=...`. In a tab that
+already opened the printed link, the token can be left out.
 
-The studio's API only answers the studio page itself: it rejects requests with
-another site's `Origin`, requests that are not JSON, and, when bound to
-`127.0.0.1` (the default), any `Host` header other than a loopback name. If you
-bind it to another interface with `--host`, anyone who can reach that address
-can use it, so keep it on a trusted network.
+The studio's API only answers the studio page itself. Every request needs this
+start's token, which is printed only in the terminal and never written into
+the page, so another program or user on the same machine cannot use the API.
+The studio also rejects requests with another site's `Origin`, requests that
+are not JSON, and, when bound to `127.0.0.1` (the default), any `Host` header
+other than a loopback name, and the page cannot be framed by another site. If
+you bind it to another interface with `--host`, keep it on a trusted network:
+the token travels in plain HTTP there.
 
 ## Automation
 
@@ -272,11 +287,46 @@ SMTPFAST_API_KEY=sf_... feedletter send \
   --to-file recipients.txt
 ```
 
-Add `--test` to send only to the first recipient. Pair the two commands with a
-scheduled GitHub Action to send every week automatically. A ready-to-copy
-workflow is in [`examples/github-actions-newsletter.yml`](examples/github-actions-newsletter.yml):
-it builds on a cron schedule, sends with SMTPfast, and commits the history file
-back so the same post is never sent twice.
+Add `--test` to send only to the first recipient. Pass the key in
+`SMTPFAST_API_KEY` or in a file with `--api-key-file`, not on the command line,
+where other users on the machine can read it in the process list.
+
+### GitHub Actions
+
+Pair the two commands with a scheduled GitHub Action to send every week
+automatically. A ready-to-copy workflow is in
+[`examples/github-actions-newsletter.yml`](examples/github-actions-newsletter.yml).
+It builds on a cron schedule, sends with SMTPfast, and commits the history file
+back so the same post is never sent twice:
+
+- **Run it in a private repository.** The history file it commits records who
+  was sent each issue, and Actions logs can name addresses that failed. Git
+  keeps every commit, so making a repository private later does not take back
+  what was pushed. History files from Feedletter 0.5 and older, or written
+  without `FEEDLETTER_HISTORY_KEY`, hold the addresses themselves.
+- **No addresses in the repository.** The recipient list comes from the
+  `NEWSLETTER_RECIPIENTS` secret and is written to a temp file outside the
+  checkout. The history file stores each recipient as a keyed hash
+  (HMAC-SHA256 with the `FEEDLETTER_HISTORY_KEY` secret), not the address. For
+  a list too big for a secret (48 KB), use `feedletter broadcast` with your
+  SMTPfast contacts.
+- **History is saved after every send attempt**, a failed or cancelled one
+  included (`if: always()`): it is the only record of who was already reached
+  and which batches had an unknown outcome.
+- **A failed send is resumed, not rebuilt.** The job also commits the issue in
+  `dist/newsletter` when the send fails. The next run, "Re-run failed jobs"
+  included, sends that same issue again, which skips everyone already reached
+  and replays batches with an unknown outcome with their saved keys. Checkout
+  uses `ref: ${{ github.ref }}`, because a re-run otherwise checks out the
+  first run's commit, which has no record of what that run sent. To drop an
+  unfinished issue instead, delete `dist/newsletter` from the repository.
+- **One run at a time**, through a `concurrency:` group, so two runs never send
+  the same issue.
+- **A pinned Feedletter version** (`FEEDLETTER_VERSION`), so a new release
+  never runs with your SMTPfast key before you choose it.
+- If pushing the history fails three times, the job fails and says so. Do not
+  rerun it until the history is in the repository, or people who already have
+  the email get it again.
 
 ## Sending with SMTPfast
 
@@ -321,11 +371,14 @@ happened, it stops and says so:
   follows such an attempt does not count as "not sent". If the outcome is
   still unknown (or the process crashes), the batch stays uncertain and the
   send stops. Run the same command again: it replays each uncertain batch with
-  its key (within SMTPfast's 24 hour key window), so a batch that went out is
-  marked sent and one that never did is sent now, then it continues with the
-  rest. A batch it cannot replay (the key expired, the recipient list changed,
-  or the replay was refused) stays uncertain and is skipped; check the
-  SMTPfast logs, then use `--resend` only if those addresses did not get it.
+  its key, so a batch that went out is marked sent and one that never did is
+  sent now, then it continues with the rest. SMTPfast answers a repeated key
+  for 24 hours, so Feedletter replays a batch only while its first attempt (or
+  its latest `--resend`) is less than 23 hours old; the hour in between allows
+  for clock differences. A batch it cannot replay (it is older than that, the
+  recipient list changed, or the replay was refused) stays uncertain and is
+  skipped, and `send` says so; check the SMTPfast logs, then use `--resend`
+  only if those addresses did not get it.
   `--resend` uses new keys, so it really sends again. With `--no-history`
   there is no record, so a rerun sends to everyone.
 - `broadcast` records the id of the broadcast it creates and reuses it only
@@ -336,6 +389,9 @@ happened, it stops and says so:
   send is lost, Feedletter reads the broadcast's status before it reports. If
   the answer to creating a draft is lost, it stops and asks you to check your
   broadcasts in SMTPfast.
+- SMTPfast calls never follow a redirect, so the API key and the email only go
+  to the API URL you set. A redirect stops the send as "not sent" and names
+  where it pointed.
 - A send holds a lock file next to the history file (`<history>.lock`), so two
   processes that share it cannot send at once, and the history file is only
   written while the lock is held. If a send stops without removing its lock
@@ -352,6 +408,19 @@ By default, `build` writes a real SQLite file at:
 
 Each generated item is recorded by URL when possible, with a hash fallback for
 local content. Future builds skip previously included items.
+
+`send` also records send progress in the same file: each recipient of an issue
+with its state (sent, or uncertain with the batch's `Idempotency-Key`), so a
+rerun skips people who already have it. Set `FEEDLETTER_HISTORY_KEY` to a long
+random value (`openssl rand -hex 32`) to store each recipient as a keyed hash
+(HMAC-SHA256) instead of the address. With it set, Feedletter turns any plain
+addresses already in the file into hashes the next time it writes the file.
+Use the same key on every run: without it, or with another key, `send` cannot
+tell who already has an issue, so it stops instead of sending. Without the key,
+`send` and the studio warn that addresses are stored in plain text. A file
+with hashes cannot be read by Feedletter 0.5 or older, which would send to
+everyone again, so do not downgrade. Treat the history file as private data
+either way, and never commit it to a public repository.
 
 Useful flags:
 
@@ -443,6 +512,21 @@ If a command needs the prompt as an argument instead of stdin, include
 feedletter build --rss https://example.com/feed.xml --agent-command "my-writer --prompt {prompt}"
 ```
 
+The prompt holds feed text that you do not control, so the writer runs with
+less than Feedletter itself has:
+
+- It runs in a new, empty temporary folder, not where you started Feedletter,
+  and the folder is removed afterwards. A relative path to a script in the
+  command is made absolute first. Codex needs `--skip-git-repo-check` there:
+  `--agent-command "codex exec --skip-git-repo-check"`.
+- It gets only the variables it needs to run and to find its own login and
+  settings: `PATH`, `HOME`, the user and locale variables, temp and proxy
+  settings, and `CLAUDE_CONFIG_DIR` and `CODEX_HOME`. Feedletter's own keys
+  (`SMTPFAST_API_KEY`, `DAILY_DEV_TOKEN`, `OPENAI_API_KEY`, `AI_API_KEY`,
+  `FEEDLETTER_HISTORY_KEY`) never reach it. If the writer takes its API key
+  from the environment, name it with `--agent-env`, for example
+  `--agent-env ANTHROPIC_API_KEY`.
+
 ## Output
 
 Feedletter writes:
@@ -466,7 +550,12 @@ author: "Team"
 ```
 
 Supported URL fields: `url`, `canonical`, `canonicalUrl`, or `slug` combined
-with `--base-url`.
+with `--base-url`. Only `http(s)` links reach the email; other link schemes in
+front matter (such as `javascript:`) are dropped.
+
+Front matter is read as data only: YAML (`---`) or JSON (`---json`). A file
+whose front matter starts with `---js` or `---javascript` is refused with an
+error naming the file, because that format runs the block as code.
 
 ## Roadmap
 

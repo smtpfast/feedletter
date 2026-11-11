@@ -6,7 +6,8 @@ import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
 import { DAILY_DEV_FEEDS, dailyDevFeedLabel, loadDailyDevFeed, parseDailyDevFeed } from "./dailydev.js";
-import { HistoryStore, itemHistoryKey } from "./history.js";
+import { smtpfastKey } from "./api-key.js";
+import { HISTORY_KEY_ENV, HistoryStore, historyKeyFrom, itemHistoryKey, PLAIN_RECIPIENTS_WARNING } from "./history.js";
 import { startPreviewServer } from "./preview.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
@@ -26,9 +27,9 @@ import {
   UNSUBSCRIBE_PLACEHOLDER,
   type SendCheckpoint,
 } from "./smtpfast.js";
-import { startStudioServer } from "./studio.js";
+import { startStudioServer, studioUrl } from "./studio.js";
 import { hostLabel, requireOneSource, writeOutputFile } from "./utils.js";
-import { enrichIssueWithCommand } from "./writer.js";
+import { enrichIssueWithCommand, parseEnvNames } from "./writer.js";
 import type { DigestIssue } from "./types.js";
 
 const { version } = createRequire(import.meta.url)("../package.json") as { version: string };
@@ -53,6 +54,10 @@ async function readIssue(dir: string): Promise<DigestIssue> {
     throw new Error(`${file} is not valid JSON.`);
   }
 }
+
+const API_KEY_FILE_HELP = "File that holds the SMTPfast API key (defaults to SMTPFAST_API_KEY)";
+const API_KEY_HELP = "Deprecated: other local users can read it in the process list. Use --api-key-file or SMTPFAST_API_KEY";
+const AGENT_ENV_HELP = "More environment variables to pass to the writer, by name, such as ANTHROPIC_API_KEY";
 
 function plural(count: number, word: string) {
   return `${count.toLocaleString("en")} ${word}${count === 1 ? "" : word.endsWith("s") ? "es" : "s"}`;
@@ -81,11 +86,14 @@ program
   .option("--ai-model <model>", "AI model name", process.env.AI_MODEL)
   .option("--agent-command <command>", "External writer command. Receives the editorial prompt on stdin and must print JSON.")
   .option("--agent-timeout <ms>", "External writer command timeout", "120000")
+  .option("--agent-env <names>", AGENT_ENV_HELP)
   .option("--tone <tone>", "AI writing tone", "clear, useful, developer-friendly")
   .action(async (options) => {
     let history: HistoryStore | undefined;
     try {
       requireOneSource(options.rss, options.content, options.dailydev);
+      const agentEnv = parseEnvNames(options.agentEnv);
+      const historyKey = historyKeyFrom(process.env[HISTORY_KEY_ENV]);
       const dailyDevFeed = options.dailydev ? parseDailyDevFeed(options.dailydev) : undefined;
       if (options.dailydevLink !== "article" && options.dailydevLink !== "discussion") {
         throw new Error("--dailydev-link must be article or discussion.");
@@ -125,7 +133,7 @@ program
       let skippedSeenCount = 0;
       let freshItems = loadedItems;
       if (options.history && !options.includeSeen) {
-        history = await HistoryStore.open(path.resolve(options.historyDb));
+        history = await HistoryStore.open(path.resolve(options.historyDb), { recipientKey: historyKey });
         const seen = history.seenKeys(loadedItems);
         freshItems = loadedItems.filter((item) => {
           const isSeen = seen.has(itemHistoryKey(item));
@@ -133,7 +141,7 @@ program
           return !isSeen;
         });
       } else if (options.history) {
-        history = await HistoryStore.open(path.resolve(options.historyDb));
+        history = await HistoryStore.open(path.resolve(options.historyDb), { recipientKey: historyKey });
       }
 
       const items = freshItems.slice(0, limit);
@@ -169,7 +177,7 @@ program
         if (!Number.isFinite(timeoutMs) || timeoutMs < 1000) {
           throw new Error("--agent-timeout must be at least 1000ms.");
         }
-        issue = await enrichIssueWithCommand(issue, options.agentCommand, options.tone, timeoutMs);
+        issue = await enrichIssueWithCommand(issue, options.agentCommand, options.tone, timeoutMs, { env: agentEnv });
       }
 
       const outDir = path.resolve(options.out);
@@ -226,6 +234,7 @@ program
   .option("--no-history", "Do not track or flag previously sent items")
   .option("--agent-command <command>", "Use an external writer (e.g. \"claude -p\" or \"codex\") for Improve, instead of the AI API")
   .option("--agent-timeout <ms>", "External writer command timeout", "120000")
+  .option("--agent-env <names>", AGENT_ENV_HELP)
   .action(async (options) => {
     try {
       const port = Number.parseInt(options.port, 10);
@@ -234,7 +243,8 @@ program
       if (options.agentCommand && (!Number.isFinite(agentTimeoutMs) || agentTimeoutMs < 1000)) {
         throw new Error("--agent-timeout must be at least 1000ms.");
       }
-      await startStudioServer({
+      const historyKey = historyKeyFrom(process.env[HISTORY_KEY_ENV]);
+      const server = await startStudioServer({
         host: options.host,
         port,
         contentDir: options.content,
@@ -242,11 +252,15 @@ program
         defaultFrom: options.from,
         historyDb: options.historyDb,
         history: options.history,
+        historyKey,
         agentCommand: options.agentCommand,
         agentTimeoutMs,
+        agentEnv: parseEnvNames(options.agentEnv),
         dailyDevToken: process.env.DAILY_DEV_TOKEN?.trim() || undefined,
       });
-      console.log(`Feedletter Studio running at http://${options.host}:${port}`);
+      if (options.history && !historyKey) console.error(PLAIN_RECIPIENTS_WARNING);
+      console.log(`Feedletter Studio running at ${studioUrl(options.host, port, server.sessionToken)}`);
+      console.log("Open that link: the token in it is new for every start, and the studio answers no one without it.");
     } catch (error) {
       console.error(error instanceof Error ? error.message : String(error));
       process.exitCode = 1;
@@ -261,7 +275,8 @@ program
   .option("--to <list>", "Recipients, comma/space/newline separated")
   .option("--to-file <path>", "File with one recipient per line (# comments allowed)")
   .option("--footer <text>", "Footer note shown above the unsubscribe link")
-  .option("--api-key <key>", "SMTPfast API key (defaults to SMTPFAST_API_KEY)")
+  .option("--api-key-file <path>", API_KEY_FILE_HELP)
+  .option("--api-key <key>", API_KEY_HELP)
   .option("--api-url <url>", "SMTPfast API base URL", process.env.SMTPFAST_API_URL ?? SMTPFAST_DEFAULT_BASE_URL)
   .option("--test", "Send only to the first recipient and skip history")
   .option("--resend", "Send to every recipient, even ones an earlier run of this exact issue reached or may have reached")
@@ -270,8 +285,8 @@ program
   .action(async (options) => {
     let history: HistoryStore | undefined;
     try {
-      const apiKey = options.apiKey ?? process.env.SMTPFAST_API_KEY;
-      if (!apiKey) throw new Error("Provide --api-key or set SMTPFAST_API_KEY.");
+      const apiKey = await smtpfastKey(options);
+      const historyKey = historyKeyFrom(process.env[HISTORY_KEY_ENV]);
 
       const issue = await readIssue(options.dir);
 
@@ -312,16 +327,17 @@ program
         // skips addresses already sent and replays uncertain batches with their
         // Idempotency-Key. The lock stops two processes from sending with the
         // same history file.
-        history = await HistoryStore.open(path.resolve(options.historyDb));
+        if (!historyKey) console.error(PLAIN_RECIPIENTS_WARNING);
+        history = await HistoryStore.open(path.resolve(options.historyDb), { recipientKey: historyKey });
         const store = history;
         const key = sendKey(message);
         results = await store.exclusive(async () => {
           const checkpoint: SendCheckpoint = {
-            previous: options.resend ? new Map() : store.sentRecipients(key),
+            previous: options.resend ? new Map() : store.sentRecipients(key, checked.valid),
             record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
             forget: (recipients) => store.forgetRecipients(key, recipients),
             // --resend sends everyone again, so it replays nothing.
-            uncertainBatches: () => (options.resend ? [] : store.uncertainBatches(key)),
+            uncertainBatches: () => (options.resend ? [] : store.uncertainBatches(key, checked.valid)),
           };
           const out = await sendDigest(config, message, checked.valid, { checkpoint });
           if (out.some((r) => r.ok || r.alreadySent)) await store.recordIssue(issue);
@@ -346,6 +362,10 @@ program
         console.error(
           `  ${plural(uncertain.length, "address")} may or may not have the email (SMTPfast gave a 5xx or no answer). They are skipped on a rerun; check the SMTPfast logs, then use --resend only if they did not get it.`,
         );
+        const expired = uncertain.filter((r) => r.replayExpired).length;
+        if (expired) {
+          console.error(`  ${plural(expired, "address")} of them went out in a batch over 23 hours ago, too long ago for SMTPfast to check, so it was not tried again.`);
+        }
       }
       for (const failure of failures) console.error(`  ${failure.recipient}: ${failure.error}`);
       if (failures.length > 0 || uncertain.length > 0) process.exitCode = 1;
@@ -367,15 +387,16 @@ program
   .option("--footer <text>", "Footer note shown above the unsubscribe link")
   .option("--send", "Send now. Without it, Feedletter creates a draft to review and send in SMTPfast")
   .option("--resend", "Create a new broadcast even if this exact issue was already broadcast")
-  .option("--api-key <key>", "SMTPfast API key (defaults to SMTPFAST_API_KEY)")
+  .option("--api-key-file <path>", API_KEY_FILE_HELP)
+  .option("--api-key <key>", API_KEY_HELP)
   .option("--api-url <url>", "SMTPfast API base URL", process.env.SMTPFAST_API_URL ?? SMTPFAST_DEFAULT_BASE_URL)
   .option("--history-db <path>", "SQLite file used to record sent items and the broadcast id", ".feedletter/feedletter.sqlite")
   .option("--no-history", "Do not record sent items or the broadcast id")
   .action(async (options) => {
     let history: HistoryStore | undefined;
     try {
-      const apiKey = options.apiKey ?? process.env.SMTPFAST_API_KEY;
-      if (!apiKey) throw new Error("Provide --api-key or set SMTPFAST_API_KEY.");
+      const apiKey = await smtpfastKey(options);
+      const historyKey = historyKeyFrom(process.env[HISTORY_KEY_ENV]);
       const config = { apiKey, baseUrl: options.apiUrl };
       const issue = await readIssue(options.dir);
 
@@ -462,7 +483,7 @@ program
       };
 
       if (options.history) {
-        history = await HistoryStore.open(path.resolve(options.historyDb));
+        history = await HistoryStore.open(path.resolve(options.historyDb), { recipientKey: historyKey });
         const store = history;
         await store.exclusive(() => run(store));
       } else {

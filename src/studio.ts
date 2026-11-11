@@ -1,11 +1,11 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import path from "node:path";
 import { buildFallbackIssue, enrichIssueWithAi } from "./ai.js";
 import { loadContentDirectory } from "./content.js";
 import { DAILY_DEV_TOKEN_URL, dailyDevFeedLabel, loadDailyDevFeed, parseDailyDevFeed } from "./dailydev.js";
-import { HistoryLockError, HistoryStore, itemHistoryKey } from "./history.js";
+import { HistoryLockError, HistoryStore, historyKeyFrom, itemHistoryKey } from "./history.js";
+import { bindNeedsHostGuard, hostnameOf, isLoopbackHost } from "./local-guard.js";
 import { renderHtml, renderText } from "./render.js";
 import { loadRssFeed } from "./rss.js";
 import {
@@ -30,6 +30,8 @@ import type { DigestIssue, SourceItem } from "./types.js";
 import { hostLabel } from "./utils.js";
 import { enrichIssueWithCommand } from "./writer.js";
 
+export { bindNeedsHostGuard, isLoopbackHost } from "./local-guard.js";
+
 export interface StudioOptions {
   host: string;
   port: number;
@@ -40,6 +42,10 @@ export interface StudioOptions {
   history?: boolean;
   agentCommand?: string;
   agentTimeoutMs?: number;
+  /** More environment variables, by name, for the writer command. */
+  agentEnv?: string[];
+  /** Store list-send recipients in the history file as keyed hashes (FEEDLETTER_HISTORY_KEY). */
+  historyKey?: string;
   /** A daily.dev token from the environment. It stays on the server; the page never sees it. */
   dailyDevToken?: string;
   /** Tests point this at a local server. */
@@ -61,56 +67,33 @@ interface ServerContext extends StudioOptions {
 }
 
 const MAX_BODY_BYTES = 5 * 1024 * 1024;
-/** Lowercase a host and strip IPv6 brackets: "[::1]" and "::1" compare equal. */
-function normalizeHost(host: string) {
-  return host.trim().toLowerCase().replace(/^\[(.*)\]$/, "$1");
-}
 
-/** The hostname part of a Host header, without the port. */
-function hostnameOf(hostHeader: string | undefined) {
-  if (!hostHeader) return "";
-  const value = hostHeader.trim();
-  const bracketed = /^\[([^\]]+)\](?::\d+)?$/.exec(value);
-  return normalizeHost(bracketed ? bracketed[1] : value.replace(/:\d+$/, ""));
-}
-
-function isIpv6Loopback(address: string) {
-  if (/^::ffff:127\./.test(address)) return true;
-  const [head, tail] = address.includes("::") ? address.split("::") : [address, undefined];
-  const left = head ? head.split(":") : [];
-  const right = tail ? tail.split(":") : [];
-  const groups = tail === undefined ? left : [...left, ...Array(Math.max(8 - left.length - right.length, 0)).fill("0"), ...right];
-  return groups.length === 8 && groups.slice(0, 7).every((group) => /^0+$/.test(group)) && /^0*1$/.test(groups[7]);
-}
-
-/** localhost (any case), any 127.0.0.0/8 address, or ::1 in any spelling. */
-export function isLoopbackHost(host: string) {
-  const h = normalizeHost(host);
-  if (h === "localhost" || h.endsWith(".localhost")) return true;
-  if (isIP(h) === 4) return h.startsWith("127.");
-  if (isIP(h) === 6) return isIpv6Loopback(h);
-  return false;
-}
+/** The header the studio page sends this launch's token in. */
+export const STUDIO_TOKEN_HEADER = "x-feedletter-token";
+const TOKEN_ERROR = "Missing or wrong studio token. Open the link that feedletter studio printed when it started.";
 
 /**
- * Whether the Host check applies: the bind address resolves to a loopback
- * address (127.1 and 2130706433 do), or it cannot be resolved (fail closed).
- * Binding to a non-loopback address such as 0.0.0.0 is an explicit opt-in.
+ * Whether a request carries this launch's token. Any local process can reach
+ * a loopback port, so the token, printed only to the terminal that started
+ * the studio, is what limits the API to the studio page. Compared in constant
+ * time over fixed-length digests.
  */
-export async function bindNeedsHostGuard(
-  bindHost: string,
-  resolve: (host: string, options: { all: true }) => Promise<Array<{ address: string }>> = lookup,
-): Promise<boolean> {
-  const host = normalizeHost(bindHost);
-  if (isLoopbackHost(host)) return true;
-  if (isIP(host)) return false;
-  try {
-    const addresses = await resolve(host, { all: true });
-    return addresses.length === 0 || addresses.some((entry) => isLoopbackHost(entry.address));
-  } catch {
-    return true;
-  }
+export function hasStudioToken(req: IncomingMessage, token: string) {
+  const sent = req.headers[STUDIO_TOKEN_HEADER];
+  if (typeof sent !== "string" || !sent) return false;
+  const digest = (value: string) => createHash("sha256").update(value).digest();
+  return timingSafeEqual(digest(sent), digest(token));
 }
+
+/** The studio page may not be framed by another site (clickjacking). */
+const PAGE_HEADERS = {
+  "content-type": "text/html; charset=utf-8",
+  "content-security-policy": "frame-ancestors 'none'",
+  "x-frame-options": "DENY",
+  "x-content-type-options": "nosniff",
+  "referrer-policy": "no-referrer",
+  "cache-control": "no-store",
+};
 
 /**
  * The studio is a local tool that can read local folders, run the writer
@@ -292,7 +275,7 @@ async function handleEnrich(req: IncomingMessage, res: ServerResponse, ctx: Serv
   // The external agent command (claude -p, codex, a custom script) takes
   // precedence when configured, so a user can opt out of the API entirely.
   const enriched = ctx.agentCommand
-    ? await enrichIssueWithCommand(base, ctx.agentCommand, tone, ctx.agentTimeoutMs ?? 120000)
+    ? await enrichIssueWithCommand(base, ctx.agentCommand, tone, ctx.agentTimeoutMs ?? 120000, { env: ctx.agentEnv })
     : await enrichIssueWithAi(base, {
         enabled: true,
         baseUrl: ctx.aiBaseUrl,
@@ -359,15 +342,15 @@ function renderSendable(body: Record<string, unknown>) {
 
 const BUSY_MESSAGE = "Another send is still running. Wait for it to finish, then try again.";
 
-/** Progress of one exact send: in the history DB, or in memory with --no-history. */
-function checkpointFor(ctx: ServerContext, key: string): SendCheckpoint {
+/** Progress of one exact send to these recipients: in the history DB, or in memory with --no-history. */
+function checkpointFor(ctx: ServerContext, key: string, recipients: string[]): SendCheckpoint {
   const store = ctx.historyStore;
   if (store) {
     return {
-      previous: store.sentRecipients(key),
+      previous: store.sentRecipients(key, recipients),
       record: (rows, state, batchKey) => store.recordRecipients(key, rows, state, batchKey),
-      forget: (recipients) => store.forgetRecipients(key, recipients),
-      uncertainBatches: () => store.uncertainBatches(key),
+      forget: (list) => store.forgetRecipients(key, list),
+      uncertainBatches: () => store.uncertainBatches(key, recipients),
     };
   }
   const sent = ctx.memorySent.get(key) ?? new Map<string, "sent" | "uncertain">();
@@ -427,7 +410,7 @@ async function handleSend(req: IncomingMessage, res: ServerResponse, ctx: Server
       results = await exclusiveSend(ctx, async () => {
         // A rerun of this exact send skips addresses an earlier run reached, or may have.
         const out = await sendDigest(config, message, checked.valid, {
-          checkpoint: checkpointFor(ctx, sendKey(message)),
+          checkpoint: checkpointFor(ctx, sendKey(message), checked.valid),
           retryDelaysMs: ctx.retryDelaysMs,
         });
         if (out.some((r) => r.ok || r.alreadySent)) await recordSent(ctx, email.subject, email.items, email.sourceLabel);
@@ -520,6 +503,8 @@ async function handleBroadcast(req: IncomingMessage, res: ServerResponse, ctx: S
 }
 
 export async function startStudioServer(options: StudioOptions) {
+  // A bad key stops the studio here, before history is opened (or skipped).
+  const historyKey = historyKeyFrom(options.historyKey);
   const ctx: ServerContext = {
     ...options,
     memorySent: new Map(),
@@ -531,7 +516,7 @@ export async function startStudioServer(options: StudioOptions) {
 
   if (options.history !== false) {
     try {
-      ctx.historyStore = await HistoryStore.open(path.resolve(options.historyDb ?? ".feedletter/feedletter.sqlite"));
+      ctx.historyStore = await HistoryStore.open(path.resolve(options.historyDb ?? ".feedletter/feedletter.sqlite"), { recipientKey: historyKey });
     } catch {
       // History is optional. If sql.js cannot initialize, run without dedup.
       ctx.historyStore = undefined;
@@ -558,6 +543,9 @@ export async function startStudioServer(options: StudioOptions) {
     dailyDevReady: Boolean(options.dailyDevToken),
   });
 
+  // A new token for every launch. It is never written into the page: the
+  // page reads it from the URL fragment, which the browser never sends.
+  const sessionToken = randomBytes(32).toString("base64url");
   const hostGuard = await bindNeedsHostGuard(options.host);
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${options.host}:${options.port}`);
@@ -565,10 +553,11 @@ export async function startStudioServer(options: StudioOptions) {
       const rejection = rejectForeignRequest(req, hostGuard);
       if (rejection) return void sendJson(res, 403, { error: rejection });
       if (req.method === "GET" && (url.pathname === "/" || url.pathname === "/index.html")) {
-        res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        res.writeHead(200, PAGE_HEADERS);
         res.end(page);
         return;
       }
+      if (url.pathname.startsWith("/api/") && !hasStudioToken(req, sessionToken)) return void sendJson(res, 401, { error: TOKEN_ERROR });
       if (req.method === "POST" && url.pathname === "/api/load") return void (await handleLoad(req, res, ctx));
       if (req.method === "POST" && url.pathname === "/api/render") return void (await handleRender(req, res));
       if (req.method === "POST" && url.pathname === "/api/enrich") return void (await handleEnrich(req, res, ctx));
@@ -584,5 +573,11 @@ export async function startStudioServer(options: StudioOptions) {
   });
 
   await new Promise<void>((resolve) => server.listen(options.port, options.host, resolve));
-  return server;
+  return Object.assign(server, { sessionToken });
+}
+
+/** The address to open: the token rides in the fragment, so it is never sent to the server or in a Referer. */
+export function studioUrl(host: string, port: number, token: string, search = "") {
+  const shownHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
+  return `http://${shownHost}:${port}/${search}#token=${token}`;
 }
