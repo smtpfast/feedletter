@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-11
+
 ### Security
 
 - Markdown front matter is read as data only. A file that starts with `---js` or `---javascript` used to run its front matter as JavaScript when `build --content` or the studio read the folder; it is now refused with an error naming the file. YAML and JSON front matter work as before.
