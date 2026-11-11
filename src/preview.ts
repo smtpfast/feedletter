@@ -1,6 +1,8 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import path from "node:path";
+import { bindNeedsHostGuard, hostnameOf, isLoopbackHost } from "./local-guard.js";
+import { safeLink } from "./render.js";
 
 interface PreviewOptions {
   dir: string;
@@ -14,6 +16,14 @@ function escapeHtml(value: string) {
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
+}
+
+function sameOrigin(origin: string, host: string | undefined) {
+  try {
+    return new URL(origin).host.toLowerCase() === (host ?? "").trim().toLowerCase();
+  } catch {
+    return false;
+  }
 }
 
 async function readOptional(filePath: string, fallback = "") {
@@ -97,7 +107,7 @@ function previewShell(issueJson: string, text: string) {
         ${items
           .map(
             (item) => `<div class="item">
-              ${item.url ? `<a href="${escapeHtml(item.url)}" target="_blank">${escapeHtml(item.title ?? "Untitled")}</a>` : `<strong>${escapeHtml(item.title ?? "Untitled")}</strong>`}
+              ${safeLink(item.url) ? `<a href="${escapeHtml(safeLink(item.url)!)}" target="_blank" rel="noopener">${escapeHtml(item.title ?? "Untitled")}</a>` : `<strong>${escapeHtml(item.title ?? "Untitled")}</strong>`}
               ${item.summary ? `<p>${escapeHtml(item.summary)}</p>` : ""}
             </div>`,
           )
@@ -111,7 +121,7 @@ function previewShell(issueJson: string, text: string) {
             <button id="jsonTab" type="button">JSON</button>
           </div>
         </div>
-        <iframe id="emailPanel" src="/email.html" title="Generated email preview"></iframe>
+        <iframe id="emailPanel" src="/email.html" title="Generated email preview" sandbox="allow-same-origin allow-popups allow-popups-to-escape-sandbox"></iframe>
         <pre id="textPanel">${escapeHtml(text)}</pre>
         <pre id="jsonPanel">${escapeHtml(issueJson)}</pre>
       </section>
@@ -137,9 +147,27 @@ function previewShell(issueJson: string, text: string) {
 
 export async function startPreviewServer(options: PreviewOptions) {
   const dir = path.resolve(options.dir);
+  const hostGuard = await bindNeedsHostGuard(options.host);
   const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", `http://${options.host}:${options.port}`);
     try {
+      // On a loopback bind, a Host that is not a loopback name means DNS
+      // rebinding: a web page reading the unsent issue through this server.
+      if (hostGuard && !isLoopbackHost(hostnameOf(req.headers.host))) {
+        res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Unknown host.");
+        return;
+      }
+      if (req.headers.origin && !sameOrigin(req.headers.origin, req.headers.host)) {
+        res.writeHead(403, { "content-type": "text/plain; charset=utf-8" });
+        res.end("Cross-origin requests are not allowed.");
+        return;
+      }
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, { "content-type": "text/plain; charset=utf-8", allow: "GET, HEAD" });
+        res.end("Method not allowed");
+        return;
+      }
       if (url.pathname === "/" || url.pathname === "/index.html") {
         const [issue, text] = await Promise.all([
           readOptional(path.join(dir, "issue.json"), "{}"),

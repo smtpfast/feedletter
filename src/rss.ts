@@ -1,14 +1,24 @@
+import { lookup } from "node:dns/promises";
+import { isIP } from "node:net";
 import { XMLParser } from "fast-xml-parser";
 import type { SourceItem } from "./types.js";
 import { asArray, cleanText, decodeEntities, isHttpUrl, sortByDateDesc, truncateText } from "./utils.js";
+
+type Resolver = (host: string, options: { all: true }) => Promise<Array<{ address: string }>>;
 
 interface LoadRssOptions {
   url: string;
   limit: number;
   timeoutMs?: number;
+  /** Stop reading a feed bigger than this many bytes. */
+  maxBytes?: number;
+  /** Tests replace DNS. */
+  resolve?: Resolver;
 }
 
 const DEFAULT_TIMEOUT_MS = 15000;
+const MAX_FEED_BYTES = 10 * 1024 * 1024;
+const MAX_REDIRECTS = 5;
 const SUMMARY_MAX_LENGTH = 300;
 const USER_AGENT = "feedletter/0.2 (+https://github.com/smtpfast/feedletter)";
 
@@ -239,29 +249,171 @@ export function discoverFeedUrl(html: string, pageUrl: string): string | undefin
   return undefined;
 }
 
+function ipv4Private([a, b, c]: number[]) {
+  return (
+    a === 0 || a === 10 || a === 127 || a >= 224 ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168) ||
+    (a === 192 && b === 0 && c === 0) ||
+    (a === 198 && (b === 18 || b === 19))
+  );
+}
+
+/** The eight 16-bit groups of an IPv6 address, an embedded IPv4 tail included. */
+function ipv6Groups(address: string): number[] | undefined {
+  let text = address.replace(/%.*$/, "");
+  const v4 = /(\d+\.\d+\.\d+\.\d+)$/.exec(text);
+  if (v4) {
+    const [a, b, c, d] = v4[1].split(".").map(Number);
+    text = `${text.slice(0, v4.index)}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`;
+  }
+  const [head, tail] = text.includes("::") ? text.split("::") : [text, undefined];
+  const left = head ? head.split(":") : [];
+  const right = tail ? tail.split(":") : [];
+  const groups = tail === undefined ? left : [...left, ...Array(Math.max(8 - left.length - right.length, 0)).fill("0"), ...right];
+  const numbers = groups.map((group) => Number.parseInt(group, 16));
+  return numbers.length === 8 && numbers.every((n) => Number.isInteger(n) && n >= 0 && n <= 0xffff) ? numbers : undefined;
+}
+
+/** Loopback, private, link-local, shared (CGNAT), multicast and reserved addresses. */
+export function isPrivateAddress(address: string): boolean {
+  if (isIP(address) === 4) return ipv4Private(address.split(".").map(Number));
+  if (isIP(address) !== 6) return false;
+  const g = ipv6Groups(address);
+  if (!g) return true;
+  if (g.slice(0, 7).every((n) => n === 0) && g[7] <= 1) return true; // :: and ::1
+  const embedded = [g[6] >> 8, g[6] & 0xff, g[7] >> 8];
+  if (g.slice(0, 5).every((n) => n === 0) && g[5] === 0xffff) return ipv4Private(embedded); // ::ffff:a.b.c.d
+  if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every((n) => n === 0)) return ipv4Private(embedded); // NAT64
+  return (g[0] & 0xfe00) === 0xfc00 || (g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xff00) === 0xff00;
+}
+
+// `ifUnresolved` is the answer when DNS fails: a redirect target that cannot be
+// resolved is refused (fail closed), while an unresolvable start host counts as
+// public so its redirects get the stricter check.
+async function isPrivateHost(hostname: string, resolve: Resolver, ifUnresolved: boolean) {
+  const host = hostname.replace(/^\[(.*)\]$/, "$1").toLowerCase();
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  if (isIP(host)) return isPrivateAddress(host);
+  try {
+    const entries = await resolve(host, { all: true });
+    if (entries.length === 0) return ifUnresolved;
+    return entries.some((entry) => isPrivateAddress(entry.address));
+  } catch {
+    return ifUnresolved;
+  }
+}
+
+/**
+ * The feed's server picks where a redirect or an advertised feed link goes.
+ * From a public feed, Feedletter never follows one to a private or local
+ * address (a cloud metadata service, a router, another local server), whose
+ * answer would end up in the newsletter. A feed you point at a local address
+ * yourself can move within your network.
+ */
+interface HopGuard {
+  start: string;
+  resolve: Resolver;
+  startIsPrivate?: Promise<boolean>;
+}
+
+async function checkHop(target: URL, guard: HopGuard, from: string) {
+  if (target.protocol !== "http:" && target.protocol !== "https:") {
+    throw new Error(`The feed at ${from} sent Feedletter to a ${target.protocol.replace(/:$/, "")} address, not http(s). Feedletter does not follow it.`);
+  }
+  // The same host the feed was asked for is the operator's own choice.
+  if (target.hostname === new URL(guard.start).hostname) return;
+  guard.startIsPrivate ??= isPrivateHost(new URL(guard.start).hostname, guard.resolve, false);
+  if (await guard.startIsPrivate) return;
+  if (await isPrivateHost(target.hostname, guard.resolve, true)) {
+    throw new Error(`The feed at ${from} sent Feedletter to ${target.origin}, a private or local address. Feedletter does not follow a public feed there.`);
+  }
+}
+
+async function readLimited(response: Response, url: string, maxBytes: number): Promise<Uint8Array> {
+  const tooBig = () => new Error(`The feed at ${url} is bigger than ${Math.round(maxBytes / 1024 / 1024) || 1} MB. Feedletter stops reading there.`);
+  const declared = Number(response.headers?.get?.("content-length") ?? NaN);
+  if (Number.isFinite(declared) && declared > maxBytes) throw tooBig();
+  if (!response.body || typeof response.body.getReader !== "function") {
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength > maxBytes) throw tooBig();
+    return bytes;
+  }
+  const reader = response.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > maxBytes) {
+      await reader.cancel().catch(() => undefined);
+      throw tooBig();
+    }
+    chunks.push(value);
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return bytes;
+}
+
+/**
+ * Drop the DOCTYPE, and with it any entity declarations: feeds do not need
+ * them, and expanding them can make a small feed huge. A reference to one is
+ * then left as plain text.
+ */
+function withoutDoctype(xml: string) {
+  const root = xml.search(/<[A-Za-z_]/);
+  const doctype = (root === -1 ? xml : xml.slice(0, root)).search(/<!DOCTYPE/i);
+  return doctype === -1 ? xml : xml.slice(0, doctype) + (root === -1 ? "" : xml.slice(root));
+}
+
 function withScheme(url: string) {
   const trimmed = url.trim();
   return /^[a-z][a-z0-9+.-]*:\/\//i.test(trimmed) ? trimmed : `https://${trimmed.replace(/^\/+/, "")}`;
 }
 
-async function fetchFeed(url: string, timeoutMs: number) {
+async function fetchFeed(url: string, timeoutMs: number, guard: HopGuard, maxBytes: number) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     let response: Response;
-    try {
-      response = await fetch(url, {
-        headers: {
-          accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
-          "user-agent": USER_AGENT,
-        },
-        signal: controller.signal,
-      });
-    } catch (error) {
-      if (error instanceof Error && error.name === "AbortError") {
-        throw new Error(`The feed at ${url} did not answer within ${Math.round(timeoutMs / 1000)}s. Check the URL or try again.`);
+    let current = url;
+    for (let hop = 0; ; hop++) {
+      try {
+        response = await fetch(current, {
+          headers: {
+            accept: "application/rss+xml, application/atom+xml, application/xml;q=0.9, text/xml;q=0.9, */*;q=0.8",
+            "user-agent": USER_AGENT,
+          },
+          // Each redirect is checked before it is followed (see checkHop).
+          redirect: "manual",
+          signal: controller.signal,
+        });
+      } catch (error) {
+        if (error instanceof Error && error.name === "AbortError") {
+          throw new Error(`The feed at ${url} did not answer within ${Math.round(timeoutMs / 1000)}s. Check the URL or try again.`);
+        }
+        throw new Error(`Could not reach ${current}: ${error instanceof Error ? error.message : String(error)}. Check the URL and your connection.`);
       }
-      throw new Error(`Could not reach ${url}: ${error instanceof Error ? error.message : String(error)}. Check the URL and your connection.`);
+      const location = response.status >= 300 && response.status < 400 ? response.headers?.get?.("location") : null;
+      if (!location) break;
+      await response.body?.cancel().catch(() => undefined);
+      if (hop >= MAX_REDIRECTS) throw new Error(`The feed at ${url} redirected more than ${MAX_REDIRECTS} times.`);
+      let next: URL;
+      try {
+        next = new URL(location, current);
+      } catch {
+        throw new Error(`The feed at ${url} redirected to an address that is not valid.`);
+      }
+      await checkHop(next, guard, url);
+      current = next.toString();
     }
 
     if (!response.ok) {
@@ -277,14 +429,14 @@ async function fetchFeed(url: string, timeoutMs: number) {
     const contentType = response.headers?.get?.("content-type") ?? null;
     let bytes: Uint8Array;
     try {
-      bytes = new Uint8Array(await response.arrayBuffer());
+      bytes = await readLimited(response, url, maxBytes);
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
         throw new Error(`The feed at ${url} did not finish downloading within ${Math.round(timeoutMs / 1000)}s. Try again.`);
       }
       throw error;
     }
-    return { body: decodeFeedBody(bytes, contentType), contentType, finalUrl: response.url || url };
+    return { body: decodeFeedBody(bytes, contentType), contentType, finalUrl: current };
   } finally {
     clearTimeout(timer);
   }
@@ -292,8 +444,10 @@ async function fetchFeed(url: string, timeoutMs: number) {
 
 export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]> {
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const maxBytes = options.maxBytes ?? MAX_FEED_BYTES;
   let feedUrl = withScheme(options.url);
-  let { body, contentType, finalUrl } = await fetchFeed(feedUrl, timeoutMs);
+  const guard: HopGuard = { start: feedUrl, resolve: options.resolve ?? lookup };
+  let { body, contentType, finalUrl } = await fetchFeed(feedUrl, timeoutMs, guard, maxBytes);
 
   // A blog's home page instead of its feed: follow the feed it advertises.
   if (looksLikeHtml(body, contentType)) {
@@ -303,8 +457,9 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
         `${feedUrl} is a web page, not a feed, and it does not link to one. Paste the feed URL instead (often /feed, /rss.xml, or /atom.xml).`,
       );
     }
+    await checkHop(new URL(discovered), guard, feedUrl);
     feedUrl = discovered;
-    ({ body, contentType, finalUrl } = await fetchFeed(feedUrl, timeoutMs));
+    ({ body, contentType, finalUrl } = await fetchFeed(feedUrl, timeoutMs, guard, maxBytes));
     if (looksLikeHtml(body, contentType)) {
       throw new Error(`${feedUrl} is a web page, not a feed. Paste the feed URL instead.`);
     }
@@ -312,7 +467,7 @@ export async function loadRssFeed(options: LoadRssOptions): Promise<SourceItem[]
 
   let parsed: Record<string, unknown>;
   try {
-    parsed = parser.parse(body) as Record<string, unknown>;
+    parsed = parser.parse(withoutDoctype(body)) as Record<string, unknown>;
   } catch (error) {
     throw new Error(`The feed at ${feedUrl} is not valid XML: ${error instanceof Error ? error.message : String(error)}`);
   }

@@ -13,6 +13,22 @@ interface LoadContentOptions {
 
 const READ_CONCURRENCY = 16;
 
+function refuseJavaScriptFrontMatter(): never {
+  throw new Error("JavaScript front matter is not supported. Use YAML or JSON front matter.");
+}
+
+// gray-matter picks the parser from the word after the opening "---", and its
+// default "js"/"javascript" parser runs the block with eval. Only data formats.
+const MATTER_OPTIONS = { engines: { javascript: refuseJavaScriptFrontMatter, js: refuseJavaScriptFrontMatter } };
+
+export function parseFrontMatter(file: string, raw: string) {
+  try {
+    return matter(raw, MATTER_OPTIONS);
+  } catch (error) {
+    throw new Error(`Could not read front matter in ${file}: ${error instanceof Error ? error.message : String(error)}`);
+  }
+}
+
 function slugFromFile(filePath: string) {
   return path.basename(filePath).replace(/\.(md|mdx)$/i, "");
 }
@@ -59,7 +75,7 @@ export async function loadContentDirectory(options: LoadContentOptions): Promise
 
   const items = await mapWithConcurrency(files, READ_CONCURRENCY, async (file) => {
     const raw = await readFile(file, "utf8");
-    const parsed = matter(raw);
+    const parsed = parseFrontMatter(file, raw);
     const data = parsed.data as Record<string, unknown>;
     const slug = frontmatterString(data, ["slug"]) ?? slugFromFile(file);
     const url =
