@@ -12,7 +12,7 @@
 - An uncertain batch is replayed only while its first attempt is less than 23 hours old, inside SMTPfast's 24 hour key window. An older one stays uncertain and `send` reports it.
 - The external writer (`--agent-command`) runs in an empty temporary folder with only the environment it needs; Feedletter's own keys are not passed to it. Name more variables with the new `--agent-env`. Codex needs `--skip-git-repo-check` there.
 - SMTPfast calls never follow redirects. A redirect stops the send as not sent.
-- From a public feed, Feedletter no longer follows a redirect or an advertised feed link to a private or local address. A feed is read up to 10 MB, and entities declared in a feed's DOCTYPE are not expanded.
+- From a public feed, Feedletter no longer follows a redirect or an advertised feed link to a private or local address. A feed is read up to 10 MB, and entities declared in a feed's DOCTYPE are not expanded. A redirect to a host that cannot be resolved is refused too. The check looks up DNS before the request, so it does not stop DNS rebinding: load untrusted feeds on a machine that has no sensitive local services.
 - Emails link only `http(s)` addresses, so a `javascript:` link in front matter or a saved draft is dropped. The studio's email preview is sandboxed, the studio page cannot be framed by another site, and `preview` checks the `Host` and `Origin` headers like the studio does.
 - Releases install the locked dependencies (`package-lock.json`) without install scripts, and publish from a separate job that installs nothing.
 

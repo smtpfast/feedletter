@@ -321,6 +321,16 @@ describe("feed redirects and limits", () => {
     }
   });
 
+  it("does not follow a redirect to a host that cannot be resolved", async () => {
+    const failing = async (host: string) => {
+      if (host === "gone.example") throw new Error("ENOTFOUND");
+      return [{ address: "93.184.215.14" }];
+    };
+    serve({ "https://blog.example.com/feed.xml": { body: "", status: 302, location: "http://gone.example/feed" }, "http://gone.example/feed": { body: rssXml } });
+    await expect(loadRssFeed({ url: "https://blog.example.com/feed.xml", limit: 5, resolve: failing })).rejects.toThrow(/a private or local address/);
+    expect(calls.map((call) => call.url)).toEqual(["https://blog.example.com/feed.xml"]);
+  });
+
   it("follows a redirect to another public address, checking each hop itself", async () => {
     serve({
       "http://blog.example.com/feed": { body: "", status: 301, location: "https://blog.example.com/feed" },

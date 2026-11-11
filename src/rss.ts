@@ -290,14 +290,19 @@ export function isPrivateAddress(address: string): boolean {
   return (g[0] & 0xfe00) === 0xfc00 || (g[0] & 0xffc0) === 0xfe80 || (g[0] & 0xff00) === 0xff00;
 }
 
-async function isPrivateHost(hostname: string, resolve: Resolver) {
+// `ifUnresolved` is the answer when DNS fails: a redirect target that cannot be
+// resolved is refused (fail closed), while an unresolvable start host counts as
+// public so its redirects get the stricter check.
+async function isPrivateHost(hostname: string, resolve: Resolver, ifUnresolved: boolean) {
   const host = hostname.replace(/^\[(.*)\]$/, "$1").toLowerCase();
   if (host === "localhost" || host.endsWith(".localhost")) return true;
   if (isIP(host)) return isPrivateAddress(host);
   try {
-    return (await resolve(host, { all: true })).some((entry) => isPrivateAddress(entry.address));
+    const entries = await resolve(host, { all: true });
+    if (entries.length === 0) return ifUnresolved;
+    return entries.some((entry) => isPrivateAddress(entry.address));
   } catch {
-    return false;
+    return ifUnresolved;
   }
 }
 
@@ -320,9 +325,9 @@ async function checkHop(target: URL, guard: HopGuard, from: string) {
   }
   // The same host the feed was asked for is the operator's own choice.
   if (target.hostname === new URL(guard.start).hostname) return;
-  guard.startIsPrivate ??= isPrivateHost(new URL(guard.start).hostname, guard.resolve);
+  guard.startIsPrivate ??= isPrivateHost(new URL(guard.start).hostname, guard.resolve, false);
   if (await guard.startIsPrivate) return;
-  if (await isPrivateHost(target.hostname, guard.resolve)) {
+  if (await isPrivateHost(target.hostname, guard.resolve, true)) {
     throw new Error(`The feed at ${from} sent Feedletter to ${target.origin}, a private or local address. Feedletter does not follow a public feed there.`);
   }
 }
